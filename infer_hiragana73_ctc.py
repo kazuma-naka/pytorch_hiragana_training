@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# infer_hiragana73_ctc.py
+# draw_infer_hiragana73_ctc_tk.py
 
 from __future__ import annotations
 
 import argparse
 import json
-import math
-import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple, List
 
+import tkinter as tk
+from PIL import Image, ImageDraw, ImageFilter
 import numpy as np
-from PIL import Image
-
 import torch
 
 
@@ -50,295 +48,303 @@ def load_vocab(path: Path) -> Vocab:
     return Vocab(itos=[str(x) for x in obj["itos"]])
 
 
-# ---------------- Preprocess (match training) ----------------
-
-def _tight_bbox_of_ink(img_L: Image.Image, ink_thresh: int) -> Optional[Tuple[int, int, int, int]]:
-    """
-    White bg(255) / black ink(0) を想定。
-    ink_thresh 未満の画素を「インク」とみなし、その外接 bbox を返す。
-    """
-    a = np.array(img_L, dtype=np.uint8)
-    ink = a < int(ink_thresh)
-    ys, xs = np.where(ink)
-    if xs.size == 0:
-        return None
-    x0, x1 = int(xs.min()), int(xs.max()) + 1
-    y0, y1 = int(ys.min()), int(ys.max()) + 1
-    return (x0, y0, x1, y1)
-
-
-def preprocess_to_fixed_canvas(
-    img_path: Path,
-    target_h: int,
-    max_w: int,
-    pad: int,
-    ink_thresh: int,
-    invert_auto: bool = True,
-) -> Tuple[torch.Tensor, int, Image.Image]:
-    """
-    学習側（hiragana73 train）と同じ思想：
-      - 必要なら自動反転
-      - インク bbox をタイトクロップ(+pad)
-      - 高さ target_h へリサイズ（アスペクト維持）
-      - 左詰めで max_w に白パディング
-    Returns:
-      x: [1,1,target_h,max_w] float32 in [0,1]
-      valid_w_px: 元の（リサイズ後）有効幅(px)
-      out_L: デバッグ用（max_w,target_h）の最終入力画像
-    """
-    img = Image.open(img_path).convert("L")
-
-    if invert_auto:
-        m = float(np.array(img, dtype=np.uint8).mean())
-        # 背景が暗い（黒地に白線など）と推定したら反転して白地黒インクへ寄せる
-        if m < 127.0:
-            img = Image.fromarray(
-                255 - np.array(img, dtype=np.uint8), mode="L")
-
-    bbox = _tight_bbox_of_ink(img, ink_thresh=ink_thresh)
-    if bbox is not None:
-        x0, y0, x1, y1 = bbox
-        x0 = max(0, x0 - pad)
-        y0 = max(0, y0 - pad)
-        x1 = min(img.size[0], x1 + pad)
-        y1 = min(img.size[1], y1 + pad)
-        img = img.crop((x0, y0, x1, y1))
-
-    # resize to target_h
-    w, h = img.size
-    h = max(1, h)
-    scale = target_h / float(h)
-    new_w = max(1, int(round(w * scale)))
-    if new_w > max_w:
-        new_w = max_w
-    img = img.resize((new_w, target_h), resample=Image.BILINEAR)
-
-    # pad to max_w (white)
-    canvas = Image.new("L", (max_w, target_h), color=255)
-    canvas.paste(img, (0, 0))
-
-    arr = np.array(canvas, dtype=np.float32) / 255.0
-    x = torch.from_numpy(arr).unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
-
-    valid_w_px = int(new_w)
-    return x, valid_w_px, canvas
-
-
-def width_to_time_steps(valid_w_px: int) -> int:
-    # train で valid_width//4 を使っていた想定
-    return max(1, int(valid_w_px) // 4)
-
-
-def ctc_greedy_ids(log_probs: torch.Tensor) -> List[int]:
-    """
-    log_probs: [T,1,V] (TorchScript model output)
-    returns argmax ids for B=1
-    """
-    ids = log_probs.argmax(dim=-1)  # [T,1]
-    return ids[:, 0].tolist()
-
-
-def mean_prob_over_time(log_probs: torch.Tensor) -> torch.Tensor:
-    """
-    log_probs: [T,1,V]
-    return: [V] (time-mean probs)
-    """
-    probs = torch.exp(log_probs[:, 0, :])  # [T,V]
-    return probs.mean(dim=0)               # [V]
-
-
-# ---------------- IO helpers ----------------
-
-def list_images_in_dir(root: Path) -> List[Path]:
-    exts = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
-    out: List[Path] = []
-    for p in root.rglob("*"):
-        if p.is_file() and p.suffix.lower() in exts:
-            out.append(p)
-    out.sort()
-    return out
-
-
-# ---------------- Inference ----------------
+# ---------------- Preprocess (match hiragana73 training) ----------------
 
 @dataclass
 class InferConfig:
+    canvas_size: int = 320
+    stroke_width: int = 14
+
+    # training side params (must match)
     target_h: int = 32
     max_w: int = 256
     pad: int = 6
     ink_thresh: int = 245
     invert_auto: bool = True
-    topk: int = 5
+
+    # optional blur for drawn strokes
+    blur_radius: float = 0.6
 
 
-@torch.no_grad()
-def infer_one(
-    model: torch.jit.ScriptModule,
-    vocab: Vocab,
-    img_path: Path,
+def _crop_with_pad(img_L: Image.Image, bbox, pad: int, canvas_size: int) -> Image.Image:
+    if bbox is None:
+        raise ValueError("Nothing drawn.")
+    minx, miny, maxx, maxy = bbox
+    minx = max(minx - pad, 0)
+    miny = max(miny - pad, 0)
+    maxx = min(maxx + pad, canvas_size)
+    maxy = min(maxy + pad, canvas_size)
+    return img_L.crop((minx, miny, maxx, maxy))
+
+
+def _tight_ink_bbox(img_L: Image.Image, ink_thresh: int):
+    """
+    White bg(255) / black ink(0) を想定。
+    ink_thresh 未満の画素を「インク」とみなし、その外接 bbox を返す。
+    """
+    mask = img_L.point(lambda p: 255 if p < ink_thresh else 0, mode="L")
+    return mask.getbbox()  # None if empty
+
+
+def _resize_keep_aspect_to_h(img_L: Image.Image, target_h: int) -> Image.Image:
+    w, h = img_L.size
+    if h <= 0:
+        return img_L
+    scale = target_h / float(h)
+    new_w = max(1, int(round(w * scale)))
+    return img_L.resize((new_w, target_h), resample=Image.Resampling.BILINEAR)
+
+
+def _pad_to_max_w(img_L: Image.Image, max_w: int, bg: int = 255) -> Image.Image:
+    w, h = img_L.size
+    if w >= max_w:
+        return img_L.crop((0, 0, max_w, h))
+    out = Image.new("L", (max_w, h), bg)
+    out.paste(img_L, (0, 0))
+    return out
+
+
+def preprocess_for_infer_hiragana73(
+    img_L: Image.Image,
     cfg: InferConfig,
-    device: str,
-) -> dict:
-    x, valid_w_px, debug_img = preprocess_to_fixed_canvas(
-        img_path=img_path,
-        target_h=cfg.target_h,
-        max_w=cfg.max_w,
-        pad=cfg.pad,
-        ink_thresh=cfg.ink_thresh,
-        invert_auto=cfg.invert_auto,
-    )
+    strokes_bbox,
+) -> Tuple[torch.Tensor, int, Image.Image]:
+    """
+    hiragana73 train スクリプトの preprocess_to_fixed_canvas に寄せる：
+      - 必要なら自動反転（手書きは通常不要だがオプション保持）
+      - インク bbox タイトクロップ(+pad)
+      - target_h へリサイズ
+      - max_w へ白パディング（ここが重要）
+    Returns:
+      x: [1,1,target_h,max_w]
+      valid_w_px: リサイズ後の有効幅(px)（time-step切り詰めに使う）
+      out_L: デバッグ用（最終入力）
+    """
+    if strokes_bbox is None:
+        raise ValueError("Nothing drawn.")
 
-    x = x.to(device)
-    log_probs = model(x)  # [T,1,V]
+    # 0) strokes_bboxで粗く切る（キャンバス外余白削り）
+    cropped = _crop_with_pad(img_L, strokes_bbox, pad=0,
+                             canvas_size=cfg.canvas_size)
 
-    # cut to valid time steps
-    T_valid = width_to_time_steps(valid_w_px)
-    T_valid = min(T_valid, int(log_probs.shape[0]))
-    log_probs = log_probs[:T_valid]
+    # 1) インク領域 bbox で “余白ゼロ” に切る
+    tb = _tight_ink_bbox(cropped, ink_thresh=int(cfg.ink_thresh))
+    if tb is None:
+        raise ValueError("Nothing drawn.")
+    cropped = cropped.crop(tb)
 
-    ids = ctc_greedy_ids(log_probs)
-    text = vocab.decode_greedy_ctc(ids)
+    # 2) blur（必要なら）
+    if cfg.blur_radius and cfg.blur_radius > 0:
+        cropped = cropped.filter(
+            ImageFilter.GaussianBlur(radius=float(cfg.blur_radius)))
 
-    # confidence (time-mean prob max)
-    mp = mean_prob_over_time(log_probs)  # [V]
-    conf = float(mp.max().item())
+    # 3) 自動反転（念のため）
+    if cfg.invert_auto:
+        m = float(np.array(cropped, dtype=np.uint8).mean())
+        if m < 127.0:
+            cropped = Image.fromarray(
+                255 - np.array(cropped, dtype=np.uint8), mode="L")
 
-    # top-k tokens (including blank)
-    k = max(1, int(cfg.topk))
-    k = min(k, int(mp.shape[0]))
-    topv, topi = torch.topk(mp, k=k)
+    # 4) target_h に揃える（幅は可変）
+    resized = _resize_keep_aspect_to_h(cropped, cfg.target_h)
 
-    def id_to_token(i: int) -> str:
-        if i == 0:
-            return "[BLANK]"
-        j = i - 1
-        if 0 <= j < len(vocab.itos):
-            return vocab.itos[j]
-        return f"[ID{i}]"
+    # 5) max_w へ白パディング（学習と合わせる）
+    w = resized.size[0]
+    if w > cfg.max_w:
+        resized = resized.crop((0, 0, cfg.max_w, resized.size[1]))
+        w = cfg.max_w
+    padded = _pad_to_max_w(resized, cfg.max_w, bg=255)
 
-    topk_list = []
-    for v, i in zip(topv.tolist(), topi.tolist()):
-        topk_list.append({"token": id_to_token(int(i)), "prob": float(v)})
+    arr = np.array(padded, dtype=np.float32) / 255.0  # [H,W]
+    x = torch.from_numpy(arr).unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
 
-    return {
-        "path": str(img_path),
-        "pred": text,
-        "conf": conf,
-        "valid_w_px": int(valid_w_px),
-        "T_valid": int(T_valid),
-        "topk": topk_list,
-    }
+    valid_w_px = int(w)
+    return x, valid_w_px, padded
+
+
+def width_to_time_steps(valid_w_px: int) -> int:
+    return max(1, int(valid_w_px) // 4)
+
+
+def ctc_greedy_ids(log_probs: torch.Tensor) -> List[int]:
+    ids = log_probs.argmax(dim=-1)  # [T,1]
+    return ids[:, 0].tolist()
+
+
+# ---------------- App ----------------
+
+class DrawInferApp:
+    def __init__(self, model_ts: Path, vocab_json: Path, cfg: InferConfig, device: str = "cpu"):
+        self.cfg = cfg
+        self.device = device
+
+        self.model = torch.jit.load(str(model_ts), map_location=device).eval()
+        self.vocab = load_vocab(vocab_json)
+
+        self.root = tk.Tk()
+        self.root.title("Draw -> Hiragana73 CTC Inference (TorchScript)")
+
+        self.canvas = tk.Canvas(
+            self.root,
+            width=cfg.canvas_size,
+            height=cfg.canvas_size,
+            bg="white",
+            cursor="cross",
+        )
+        self.canvas.grid(row=0, column=0, columnspan=6, padx=10, pady=10)
+
+        self.img = Image.new("L", (cfg.canvas_size, cfg.canvas_size), 255)
+        self.draw = ImageDraw.Draw(self.img)
+
+        self.last: Optional[Tuple[int, int]] = None
+        self.strokes_bbox = None
+
+        self.canvas.bind("<ButtonPress-1>", self.on_down)
+        self.canvas.bind("<B1-Motion>", self.on_move)
+        self.canvas.bind("<ButtonRelease-1>", self.on_up)
+
+        tk.Button(self.root, text="Infer", command=self.infer).grid(
+            row=1, column=0, sticky="ew", padx=10, pady=5)
+        tk.Button(self.root, text="Clear", command=self.clear).grid(
+            row=1, column=1, sticky="ew", padx=10, pady=5)
+        tk.Button(self.root, text="Save debug", command=self.save_debug).grid(
+            row=1, column=2, sticky="ew", padx=10, pady=5)
+        tk.Button(self.root, text="Quit", command=self.root.quit).grid(
+            row=1, column=3, sticky="ew", padx=10, pady=5)
+
+        self.result_var = tk.StringVar(
+            value="Draw hiragana, then click Infer.")
+        tk.Label(self.root, textvariable=self.result_var).grid(
+            row=2, column=0, columnspan=6, padx=10, pady=10)
+
+        self._last_debug_input: Optional[Image.Image] = None
+
+    def update_bbox(self, x: int, y: int):
+        r = self.cfg.stroke_width // 2 + 2
+        box = (x - r, y - r, x + r, y + r)
+        if self.strokes_bbox is None:
+            self.strokes_bbox = box
+        else:
+            minx = min(self.strokes_bbox[0], box[0])
+            miny = min(self.strokes_bbox[1], box[1])
+            maxx = max(self.strokes_bbox[2], box[2])
+            maxy = max(self.strokes_bbox[3], box[3])
+            self.strokes_bbox = (minx, miny, maxx, maxy)
+
+    def on_down(self, event):
+        self.last = (event.x, event.y)
+        self.update_bbox(event.x, event.y)
+
+    def on_move(self, event):
+        if self.last is None:
+            return
+        x0, y0 = self.last
+        x1, y1 = event.x, event.y
+
+        self.canvas.create_line(
+            x0, y0, x1, y1,
+            fill="black",
+            width=self.cfg.stroke_width,
+            capstyle=tk.ROUND,
+            smooth=True,
+            splinesteps=36,
+        )
+        self.draw.line((x0, y0, x1, y1), fill=0, width=self.cfg.stroke_width)
+
+        self.last = (x1, y1)
+        self.update_bbox(x1, y1)
+
+    def on_up(self, event):
+        self.last = None
+
+    def clear(self):
+        self.canvas.delete("all")
+        self.img = Image.new(
+            "L", (self.cfg.canvas_size, self.cfg.canvas_size), 255)
+        self.draw = ImageDraw.Draw(self.img)
+        self.strokes_bbox = None
+        self._last_debug_input = None
+        self.result_var.set("Cleared.")
+
+    def infer(self):
+        try:
+            x, valid_w_px, dbg = preprocess_for_infer_hiragana73(
+                self.img, self.cfg, self.strokes_bbox
+            )
+            self._last_debug_input = dbg
+
+            x = x.to(self.device)
+            with torch.no_grad():
+                log_probs = self.model(x)  # [T,1,V]
+
+            # 有効幅に対応する time steps だけに切る
+            T_valid = width_to_time_steps(valid_w_px)
+            T_valid = min(T_valid, int(log_probs.shape[0]))
+            log_probs = log_probs[:T_valid]
+
+            ids = ctc_greedy_ids(log_probs)
+            text = self.vocab.decode_greedy_ctc(ids)
+            self.result_var.set(f"Text: {text}")
+        except Exception as e:
+            self.result_var.set(f"Error: {e}")
+
+    def save_debug(self):
+        try:
+            if self._last_debug_input is None:
+                _, _, dbg = preprocess_for_infer_hiragana73(
+                    self.img, self.cfg, self.strokes_bbox
+                )
+                self._last_debug_input = dbg
+
+            out = Path("debug_hiragana73_ctc_input.png")
+            self._last_debug_input.save(out)
+            self.result_var.set(f"Saved {out}")
+        except Exception as e:
+            self.result_var.set(f"Error: {e}")
+
+    def run(self):
+        self.root.mainloop()
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", type=str, required=True,
-                    help="TorchScript model (.pt)")
+                    help="Path to TorchScript model (.pt)")
     ap.add_argument("--vocab", type=str, required=True,
-                    help="vocab.json (itos list)")
-    ap.add_argument("--image", type=str, default="", help="Single image path")
-    ap.add_argument("--dir", type=str, default="",
-                    help="Directory to infer recursively")
-    ap.add_argument("--out_jsonl", type=str, default="",
-                    help="Write results as JSONL")
-    ap.add_argument("--save_debug_dir", type=str, default="",
-                    help="Save preprocessed input images here (optional)")
-
+                    help="Path to vocab.json")
     ap.add_argument("--device", type=str, default="cpu",
                     choices=["cpu", "cuda"])
 
-    # preprocess (match training defaults)
+    ap.add_argument("--canvas_size", type=int, default=320)
+    ap.add_argument("--stroke_width", type=int, default=14)
+
+    # must match training
     ap.add_argument("--target_h", type=int, default=32)
     ap.add_argument("--max_w", type=int, default=256)
     ap.add_argument("--pad", type=int, default=6)
     ap.add_argument("--ink_thresh", type=int, default=245)
     ap.add_argument("--no_invert_auto", action="store_true")
 
-    # output
-    ap.add_argument("--topk", type=int, default=5)
+    ap.add_argument("--blur", type=float, default=0.6)
 
     args = ap.parse_args()
-
-    if not args.image and not args.dir:
-        raise SystemExit("ERROR: specify --image or --dir")
 
     device = "cuda" if (
         args.device == "cuda" and torch.cuda.is_available()) else "cpu"
 
-    model = torch.jit.load(str(Path(args.model)), map_location=device).eval()
-    vocab = load_vocab(Path(args.vocab))
-
     cfg = InferConfig(
+        canvas_size=int(args.canvas_size),
+        stroke_width=int(args.stroke_width),
         target_h=int(args.target_h),
         max_w=int(args.max_w),
         pad=int(args.pad),
         ink_thresh=int(args.ink_thresh),
         invert_auto=(not args.no_invert_auto),
-        topk=int(args.topk),
+        blur_radius=float(args.blur),
     )
 
-    out_jsonl = Path(args.out_jsonl) if args.out_jsonl else None
-    save_debug_dir = Path(args.save_debug_dir) if args.save_debug_dir else None
-    if save_debug_dir:
-        save_debug_dir.mkdir(parents=True, exist_ok=True)
-    if out_jsonl:
-        out_jsonl.parent.mkdir(parents=True, exist_ok=True)
-
-    results: List[dict] = []
-
-    if args.image:
-        img_path = Path(args.image)
-        r = infer_one(model, vocab, img_path, cfg, device=device)
-        results.append(r)
-
-        print(f"path: {r['path']}")
-        print(
-            f"pred: {r['pred']}  conf: {r['conf']:.4f}  (valid_w={r['valid_w_px']}px, T={r['T_valid']})")
-        print("topk:")
-        for t in r["topk"]:
-            print(f"  - {t['token']}: {t['prob']:.4f}")
-
-        if save_debug_dir:
-            # save preprocessed canvas for inspection
-            _, _, dbg = preprocess_to_fixed_canvas(
-                img_path=img_path,
-                target_h=cfg.target_h,
-                max_w=cfg.max_w,
-                pad=cfg.pad,
-                ink_thresh=cfg.ink_thresh,
-                invert_auto=cfg.invert_auto,
-            )
-            outp = save_debug_dir / (img_path.stem + "_pre.png")
-            dbg.save(outp)
-
-    if args.dir:
-        root = Path(args.dir)
-        files = list_images_in_dir(root)
-        if not files:
-            raise SystemExit(f"ERROR: no images found under {root}")
-
-        for p in files:
-            r = infer_one(model, vocab, p, cfg, device=device)
-            results.append(r)
-            print(f"{r['pred']}\t{r['conf']:.4f}\t{p}")
-
-            if save_debug_dir:
-                _, _, dbg = preprocess_to_fixed_canvas(
-                    img_path=p,
-                    target_h=cfg.target_h,
-                    max_w=cfg.max_w,
-                    pad=cfg.pad,
-                    ink_thresh=cfg.ink_thresh,
-                    invert_auto=cfg.invert_auto,
-                )
-                outp = save_debug_dir / (p.stem + "_pre.png")
-                dbg.save(outp)
-
-    if out_jsonl:
-        with out_jsonl.open("w", encoding="utf-8") as f:
-            for r in results:
-                f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        print(f"saved: {out_jsonl}")
+    app = DrawInferApp(Path(args.model), Path(args.vocab), cfg, device=device)
+    app.run()
 
 
 if __name__ == "__main__":
