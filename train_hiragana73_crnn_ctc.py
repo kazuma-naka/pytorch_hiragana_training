@@ -207,7 +207,7 @@ def preprocess_to_fixed_canvas(
     new_w = max(1, int(round(w * scale)))
     if new_w > max_w:
         new_w = max_w
-    img = img.resize((new_w, target_h), resample=Image.BILINEAR)
+    img = img.resize((new_w, target_h), resample=Image.Resampling.BILINEAR)
 
     # pad to max_w (white)
     canvas = Image.new("L", (max_w, target_h), color=255)
