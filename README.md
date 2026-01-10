@@ -34,8 +34,6 @@
 pip install torch numpy pillow
 ```
 
-````
-
 ※ Linux で tkinter が入っていない場合は、ディストリに応じて追加インストールが必要です（例: `python3-tk`）。
 
 ---
@@ -262,4 +260,3 @@ Both collector and inference apply the same preprocessing:
 - `--stroke_width`: keep consistent across collect/infer
 - `--blur`: too much blur can thicken strokes and affect recognition
 - `--ink_thresh`: increase for faint strokes; decrease for noisy backgrounds
-````
