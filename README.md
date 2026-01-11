@@ -62,6 +62,10 @@ python collect_hiragana_tk.py --out_dir dataset_hira
 python3 train_hiragana_crnn_ctc.py   --data_dir dataset_hira   --labels dataset_hira/labels.jsonl   --out_dir runs/hira_ctc_from_dataset_hira   --epochs 200 --batch_size 32 --lr 1e-3 --device cpu
 ```
 
+```bash
+python3 collect_hiragana_tk.py --auto_elastic_alpha 18 --auto_elastic_sigma 6 --auto_scale_min 0.5 --auto_scale_max 2 --auto_erode_prob 0 --auto_edge_blur 0 --auto_elastic_prob 0 --auto_pressure_prob 0 --auto_blur 0 --auto_interval_ms 1 --auto_repeat_per_token 2000 --auto_thicken_min 2 --auto_thicken_max 4 --auto_noise 0 --auto_font_ttf_list "$(printf '%s ' fonts/*.ttf fonts/*.otf 2>/dev/null)"
+```
+
 学習のポイント：
 
 - 入力画像は **高さ 32 に正規化**、幅は可変（最大 512 まで）
