@@ -8,12 +8,14 @@ import argparse
 import json
 import random
 import time
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
 
 import tkinter as tk
 import tkinter.font as tkfont
+from tkinter import filedialog, messagebox
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageTk
@@ -35,10 +37,14 @@ class CollectConfig:
 
     # --- auto draw base ---
     auto_font_ttf: Optional[Path] = None
+
+    # multiple fonts for AutoDraw (optional)
+    auto_font_ttf_list: Optional[List[Path]] = None
+
     auto_font_px: int = 180
     auto_rotate_deg: float = 10.0
 
-    # NEW: random thickness range for AutoDraw (overdraw passes)
+    # random thickness range for AutoDraw (overdraw passes)
     auto_thicken_min: int = 1
     auto_thicken_max: int = 3
 
@@ -110,7 +116,7 @@ def _tight_ink_bbox(img_L: Image.Image, ink_thresh: int = 250):
 
 
 def _preprocess_for_save(img_L: Image.Image, cfg: CollectConfig, bbox) -> Image.Image:
-    # NOTE: keep pad=0, and then do a tight bbox crop (no extra whitespace)
+    # keep pad=0, then tight bbox crop (no extra whitespace)
     cropped = _crop_with_pad(img_L, bbox, pad=0, canvas_size=cfg.canvas_size)
 
     tb = _tight_ink_bbox(cropped, ink_thresh=250)
@@ -154,6 +160,7 @@ def _guess_ttf_paths() -> List[Path]:
         Path("C:/Windows/Fonts/YuGothB.ttc"),
         Path("C:/Windows/Fonts/meiryo.ttc"),
         Path("C:/Windows/Fonts/msgothic.ttc"),
+        Path("C:/Windows/Fonts/msmincho.ttc"),
         # Linux
         Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
         Path("/usr/share/fonts/opentype/noto/NotoSansCJKjp-Regular.otf"),
@@ -168,16 +175,72 @@ def _guess_ttf_paths() -> List[Path]:
     return [p for p in candidates if p.exists()]
 
 
-def resolve_auto_font_path(cfg: CollectConfig) -> Optional[Path]:
-    if cfg.auto_font_ttf is not None and Path(cfg.auto_font_ttf).exists():
-        return Path(cfg.auto_font_ttf)
+def _can_load_font(p: Path) -> bool:
+    try:
+        ImageFont.truetype(str(p), size=16)
+        return True
+    except Exception:
+        return False
+
+
+def resolve_auto_font_paths(cfg: CollectConfig) -> List[Path]:
+    """
+    Collect candidate font paths:
+      - cfg.auto_font_ttf (single)
+      - cfg.auto_font_ttf_list (multiple)
+      - guessed system paths
+    Then filter by existence and loadability, and de-duplicate.
+    """
+    cands: List[Path] = []
+
+    if cfg.auto_font_ttf is not None:
+        p = Path(cfg.auto_font_ttf)
+        if p.exists():
+            cands.append(p)
+
+    if cfg.auto_font_ttf_list:
+        for x in cfg.auto_font_ttf_list:
+            try:
+                p = Path(x)
+            except Exception:
+                continue
+            if p.exists():
+                cands.append(p)
+
     for p in _guess_ttf_paths():
+        cands.append(p)
+
+    # de-dup (keep order)
+    seen: set[str] = set()
+    uniq: List[Path] = []
+    for p in cands:
+        key = str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(p)
+
+    # filter loadable
+    ok: List[Path] = [p for p in uniq if _can_load_font(p)]
+    return ok
+
+
+def _load_font_from_candidates(font_paths: List[Path], size: int) -> ImageFont.ImageFont:
+    """
+    Randomly choose a font path. If it fails to load, retry a few times.
+    """
+    if not font_paths:
+        return ImageFont.load_default()
+
+    attempts = min(12, max(1, len(font_paths)))
+    for _ in range(attempts):
+        p = random.choice(font_paths)
         try:
-            ImageFont.truetype(str(p), size=16)
-            return p
+            return ImageFont.truetype(str(p), size=size)
         except Exception:
             continue
-    return None
+
+    return ImageFont.load_default()
 
 
 # ---------------- Label parsing ----------------
@@ -331,7 +394,7 @@ def _apply_handwriting_effects(glyph_ink_L: Image.Image, cfg: CollectConfig) -> 
 
 # ---------------- Auto draw rendering ----------------
 
-def render_text_to_canvas_image(text: str, cfg: CollectConfig, font_path: Optional[Path]) -> Image.Image:
+def render_text_to_canvas_image(text: str, cfg: CollectConfig, font_paths: List[Path]) -> Image.Image:
     canvas = Image.new("L", (cfg.canvas_size, cfg.canvas_size), 255)
 
     smin = min(cfg.auto_scale_min, cfg.auto_scale_max)
@@ -339,10 +402,7 @@ def render_text_to_canvas_image(text: str, cfg: CollectConfig, font_path: Option
     scale = random.uniform(smin, smax)
     font_size = max(8, int(round(cfg.auto_font_px * scale)))
 
-    if font_path is not None:
-        font = ImageFont.truetype(str(font_path), size=font_size)
-    else:
-        font = ImageFont.load_default()
+    font = _load_font_from_candidates(font_paths, size=font_size)
 
     tmp = Image.new("L", (cfg.canvas_size, cfg.canvas_size), 255)
     td = ImageDraw.Draw(tmp)
@@ -356,14 +416,12 @@ def render_text_to_canvas_image(text: str, cfg: CollectConfig, font_path: Option
     glyph = Image.new("L", (gw, gh), 255)
     gd = ImageDraw.Draw(glyph)
 
-    # NEW: random thickness from range (overdraw passes)
     tmin = max(1, int(cfg.auto_thicken_min))
     tmax = max(1, int(cfg.auto_thicken_max))
     if tmax < tmin:
         tmin, tmax = tmax, tmin
     thick = random.randint(tmin, tmax)
 
-    # thicker => larger jitter so it actually looks thicker
     jitter = 1 if thick <= 2 else 2 if thick <= 4 else 3
 
     base_x = pad - bbox[0]
@@ -431,7 +489,7 @@ class CollectorApp:
         self.root = tk.Tk()
         self.root.title("Collect Hiragana Handwriting (CTC)")
 
-        self.auto_font_path = resolve_auto_font_path(self.cfg)
+        self.auto_font_paths = resolve_auto_font_paths(self.cfg)
         self.ui_font = pick_jp_font(self.root, size=self.cfg.font_size)
 
         self.canvas = tk.Canvas(
@@ -505,7 +563,12 @@ class CollectorApp:
         )
         self.preview_chk.grid(row=2, column=0, sticky="w", padx=10)
 
-        # Stop-after-sequential checkbox (GUI toggle)
+        # Load TXT button (row=2 to avoid collisions)
+        tk.Button(self.root, text="Load TXT", command=self.load_labels_from_txt, font=self.ui_font).grid(
+            row=2, column=1, sticky="w", padx=10
+        )
+
+        # Stop-after-sequential checkbox
         self.stop_after_seq_var = tk.BooleanVar(
             value=bool(self.cfg.auto_stop_after_sequential_cycle))
         self.stop_after_seq_chk = tk.Checkbutton(
@@ -516,11 +579,11 @@ class CollectorApp:
             offvalue=False,
             font=self.ui_font
         )
-        self.stop_after_seq_chk.grid(row=2, column=1, sticky="w", padx=10)
+        self.stop_after_seq_chk.grid(row=2, column=2, sticky="w", padx=10)
 
-        # NEW: Pen width for manual drawing
+        # Pen width for manual drawing
         tk.Label(self.root, text="Pen width:", font=self.ui_font).grid(
-            row=2, column=2, sticky="e", padx=(10, 4)
+            row=2, column=3, sticky="e", padx=(10, 4)
         )
         self.stroke_width_var = tk.IntVar(value=int(self.cfg.stroke_width))
         self.stroke_width_spin = tk.Spinbox(
@@ -531,13 +594,13 @@ class CollectorApp:
             font=self.ui_font,
             command=self._on_stroke_width_change
         )
-        self.stroke_width_spin.grid(row=2, column=3, sticky="w", padx=(0, 10))
+        self.stroke_width_spin.grid(row=2, column=4, sticky="w", padx=(0, 10))
         self.stroke_width_var.trace_add(
             "write", lambda *_: self._on_stroke_width_change())
 
-        # NEW: Auto thickness range (random)
+        # Auto thickness range
         tk.Label(self.root, text="Auto thickness:", font=self.ui_font).grid(
-            row=2, column=4, sticky="e", padx=(10, 4)
+            row=2, column=5, sticky="e", padx=(10, 4)
         )
         self.auto_thick_min_var = tk.IntVar(
             value=int(self.cfg.auto_thicken_min))
@@ -552,10 +615,10 @@ class CollectorApp:
             font=self.ui_font,
             command=self._on_auto_thick_range_change
         )
-        self.auto_thick_min_spin.grid(row=2, column=5, sticky="w", padx=(0, 4))
+        self.auto_thick_min_spin.grid(row=2, column=6, sticky="w", padx=(0, 4))
 
         tk.Label(self.root, text="..", font=self.ui_font).grid(
-            row=2, column=6, sticky="w")
+            row=2, column=7, sticky="w")
 
         self.auto_thick_max_spin = tk.Spinbox(
             self.root,
@@ -566,7 +629,7 @@ class CollectorApp:
             command=self._on_auto_thick_range_change
         )
         self.auto_thick_max_spin.grid(
-            row=2, column=7, sticky="w", padx=(4, 10))
+            row=2, column=8, sticky="w", padx=(4, 10))
 
         self.auto_thick_min_var.trace_add(
             "write", lambda *_: self._on_auto_thick_range_change())
@@ -575,27 +638,27 @@ class CollectorApp:
 
         self.status_var = tk.StringVar(value=f"Output: {self.cfg.out_dir}")
         tk.Label(self.root, textvariable=self.status_var, font=self.ui_font).grid(
-            row=2, column=8, columnspan=3, padx=10, pady=(6, 2), sticky="w"
+            row=3, column=0, columnspan=11, padx=10, pady=(6, 2), sticky="w"
         )
 
         self.current_token_var = tk.StringVar(value="Current token: (none)")
         tk.Label(self.root, textvariable=self.current_token_var, font=self.ui_font).grid(
-            row=3, column=0, columnspan=11, padx=10, pady=(0, 2), sticky="w"
+            row=4, column=0, columnspan=11, padx=10, pady=(0, 2), sticky="w"
         )
 
         self.auto_count_var = tk.StringVar(value="Auto: stopped")
         tk.Label(self.root, textvariable=self.auto_count_var, font=self.ui_font).grid(
-            row=4, column=0, columnspan=11, padx=10, pady=(0, 10), sticky="w"
+            row=5, column=0, columnspan=11, padx=10, pady=(0, 10), sticky="w"
         )
 
-        if self.auto_font_path is None:
+        if not self.auto_font_paths:
             self.status_var.set(
-                "Warning: auto font not found. Pass --auto_font_ttf for reliable Japanese rendering.")
+                "Warning: auto font not found. Use --auto_font_ttf or --auto_font_ttf_list for reliable Japanese rendering."
+            )
 
         self.label_entry.focus_set()
 
         self._count = 0
-
         self._auto_running = False
         self._auto_after_id: Optional[str] = None
         self._auto_saved = 0
@@ -609,9 +672,47 @@ class CollectorApp:
         self._tk_preview: Optional[ImageTk.PhotoImage] = None
         self._canvas_preview_id: Optional[int] = None
 
-        # ensure current GUI values are applied to cfg
         self._on_stroke_width_change()
         self._on_auto_thick_range_change()
+
+    # ---- load labels from txt (METHOD) ----
+
+    def load_labels_from_txt(self):
+        path = filedialog.askopenfilename(
+            title="Select a .txt file",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+
+        p = Path(path)
+
+        try:
+            data = p.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            try:
+                data = p.read_text(encoding="cp932")
+            except Exception as e:
+                messagebox.showerror(
+                    "Load error", f"Failed to read file:\n{e}")
+                return
+        except Exception as e:
+            messagebox.showerror("Load error", f"Failed to read file:\n{e}")
+            return
+
+        data = data.replace("\r\n", "\n").replace("\r", "\n")
+        data = data.replace("\n", " ")
+
+        tokens = _parse_label_tokens(data)
+        if not tokens:
+            messagebox.showwarning(
+                "No tokens", "No valid tokens were found in the text file.")
+            return
+
+        self.label_var.set(" ".join(tokens))
+        self.status_var.set(
+            f"Loaded labels from: {p.name}  tokens={len(tokens)}")
+        self.label_entry.focus_set()
 
     # ---- GUI callbacks ----
 
@@ -633,7 +734,6 @@ class CollectorApp:
         mx = max(1, min(12, mx))
         if mx < mn:
             mn, mx = mx, mn
-            # normalize UI values
             try:
                 self.auto_thick_min_var.set(mn)
                 self.auto_thick_max_var.set(mx)
@@ -759,8 +859,6 @@ class CollectorApp:
         should_stop_after = False
         if should_advance:
             is_last_token = (self._token_index == len(self._tokens) - 1)
-
-            # runtime decision uses GUI checkbox state
             stop_after_seq = bool(self.stop_after_seq_var.get())
 
             if is_last_token and stop_after_seq:
@@ -789,7 +887,7 @@ class CollectorApp:
         self._update_current_token_label(token)
 
         self.img = render_text_to_canvas_image(
-            token, self.cfg, self.auto_font_path)
+            token, self.cfg, self.auto_font_paths)
         self.draw = ImageDraw.Draw(self.img)
 
         tb = _tight_ink_bbox(self.img, ink_thresh=250)
@@ -806,12 +904,30 @@ class CollectorApp:
             return False
         return True
 
+    def _set_auto_status_running(self):
+        parts = [
+            "Auto: running",
+            f"saved={self._auto_saved}",
+        ]
+        if self.cfg.auto_limit > 0:
+            parts.append(f"/ limit={self.cfg.auto_limit}")
+        parts += [
+            f"mode={self.mode_var.get()}",
+            f"interval={self.cfg.auto_interval_ms}ms",
+            f"repeat={self.cfg.auto_repeat_per_token}",
+            f"stop_after_seq={self.stop_after_seq_var.get()}",
+            f"auto_thick={self.cfg.auto_thicken_min}..{self.cfg.auto_thicken_max}",
+            f"fonts={len(self.auto_font_paths)}",
+        ]
+        self.auto_count_var.set("  ".join(parts))
+
     def start_auto(self):
         if self._auto_running:
             return
         if not self.refresh_tokens():
             self.status_var.set(
-                "Error: label list is empty. Put labels (e.g. あ or あ,い,う) then Start.")
+                "Error: label list is empty. Put labels (e.g. あ or あ,い,う) then Start."
+            )
             self.label_entry.focus_set()
             return
 
@@ -821,15 +937,7 @@ class CollectorApp:
 
         self._auto_running = True
         self._auto_saved = 0
-        self.auto_count_var.set(
-            "Auto: running"
-            f"  saved={self._auto_saved}"
-            f"  mode={self.mode_var.get()}"
-            f"  interval={self.cfg.auto_interval_ms}ms"
-            f"  repeat={self.cfg.auto_repeat_per_token}"
-            f"  stop_after_seq={self.stop_after_seq_var.get()}"
-            f"  auto_thick={self.cfg.auto_thicken_min}..{self.cfg.auto_thicken_max}"
-        )
+        self._set_auto_status_running()
         self.status_var.set("Auto: started.")
         self._schedule_next_auto(immediate=True)
 
@@ -862,16 +970,7 @@ class CollectorApp:
                 return
 
             self._auto_saved += 1
-            parts = [
-                "Auto: running",
-                f"saved={self._auto_saved}",
-                f"mode={self.mode_var.get()}",
-                f"interval={self.cfg.auto_interval_ms}ms",
-                f"repeat={self.cfg.auto_repeat_per_token}",
-                f"stop_after_seq={self.stop_after_seq_var.get()}",
-                f"auto_thick={self.cfg.auto_thicken_min}..{self.cfg.auto_thicken_max}",
-            ]
-            self.auto_count_var.set("  ".join(parts))
+            self._set_auto_status_running()
 
             if self.cfg.auto_limit > 0 and self._auto_saved >= self.cfg.auto_limit:
                 self.stop_auto()
@@ -930,14 +1029,14 @@ def batch_generate(cfg: CollectConfig, texts: List[str], per_text: int):
     (cfg.out_dir / "images").mkdir(parents=True, exist_ok=True)
     labels_path = cfg.out_dir / "labels.jsonl"
 
-    font_path = resolve_auto_font_path(cfg)
-    if font_path is None:
-        print("Warning: auto font not found. Pass --auto_font_ttf for reliable Japanese rendering.")
+    font_paths = resolve_auto_font_paths(cfg)
+    if not font_paths:
+        print("Warning: auto font not found. Use --auto_font_ttf or --auto_font_ttf_list for reliable Japanese rendering.")
 
     count = 0
     for t in texts:
         for _ in range(per_text):
-            img = render_text_to_canvas_image(t, cfg, font_path)
+            img = render_text_to_canvas_image(t, cfg, font_paths)
             tb = _tight_ink_bbox(img, ink_thresh=250)
             if tb is None:
                 continue
@@ -959,6 +1058,30 @@ def batch_generate(cfg: CollectConfig, texts: List[str], per_text: int):
 
 # ---------------- CLI ----------------
 
+def _parse_font_list_arg(s: str) -> List[Path]:
+    """
+    Parse --auto_font_ttf_list string using shell-like splitting.
+    Examples:
+      --auto_font_ttf_list "C:/Windows/Fonts/meiryo.ttc C:/Windows/Fonts/msgothic.ttc"
+      --auto_font_ttf_list "\"C:/My Fonts/font a.ttf\" C:/Windows/Fonts/meiryo.ttc"
+    """
+    s = (s or "").strip()
+    if not s:
+        return []
+    try:
+        parts = shlex.split(s)
+    except Exception:
+        parts = s.split()
+
+    out: List[Path] = []
+    for p in parts:
+        try:
+            out.append(Path(p))
+        except Exception:
+            continue
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
 
@@ -972,14 +1095,13 @@ def main():
     ap.add_argument("--font_size", type=int, default=12)
 
     ap.add_argument("--auto_font_ttf", type=str, default="")
+    ap.add_argument("--auto_font_ttf_list", type=str, default="")
+
     ap.add_argument("--auto_font_px", type=int, default=180)
     ap.add_argument("--auto_rotate_deg", type=float, default=10.0)
 
-    # NEW: AutoDraw thickness range
     ap.add_argument("--auto_thicken_min", type=int, default=1)
     ap.add_argument("--auto_thicken_max", type=int, default=3)
-
-    # Backward compatibility (optional): if you still pass --auto_thicken, it will override min/max
     ap.add_argument("--auto_thicken", type=int, default=None)
 
     ap.add_argument("--auto_noise", type=float, default=0.01)
@@ -993,8 +1115,6 @@ def main():
     ap.add_argument("--auto_limit", type=int, default=0)
 
     ap.add_argument("--auto_repeat_per_token", type=int, default=1)
-
-    # initial checkbox state
     ap.add_argument("--auto_stop_after_sequential_cycle", action="store_true")
 
     ap.add_argument("--auto_elastic_alpha", type=float, default=12.0)
@@ -1019,12 +1139,13 @@ def main():
 
     args = ap.parse_args()
 
-    # Determine auto thickness range with backward compatibility
     th_min = int(args.auto_thicken_min)
     th_max = int(args.auto_thicken_max)
     if args.auto_thicken is not None:
         th_min = int(args.auto_thicken)
         th_max = int(args.auto_thicken)
+
+    font_list = _parse_font_list_arg(args.auto_font_ttf_list)
 
     cfg = CollectConfig(
         out_dir=Path(args.out_dir),
@@ -1037,6 +1158,8 @@ def main():
         font_size=int(args.font_size),
 
         auto_font_ttf=Path(args.auto_font_ttf) if args.auto_font_ttf else None,
+        auto_font_ttf_list=font_list if font_list else None,
+
         auto_font_px=int(args.auto_font_px),
         auto_rotate_deg=float(args.auto_rotate_deg),
 
@@ -1054,7 +1177,6 @@ def main():
         auto_limit=int(args.auto_limit),
 
         auto_repeat_per_token=int(args.auto_repeat_per_token),
-
         auto_stop_after_sequential_cycle=bool(
             args.auto_stop_after_sequential_cycle),
 
