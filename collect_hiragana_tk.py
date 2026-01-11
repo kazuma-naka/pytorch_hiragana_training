@@ -37,7 +37,11 @@ class CollectConfig:
     auto_font_ttf: Optional[Path] = None
     auto_font_px: int = 180
     auto_rotate_deg: float = 10.0
-    auto_thicken: int = 2
+
+    # NEW: random thickness range for AutoDraw (overdraw passes)
+    auto_thicken_min: int = 1
+    auto_thicken_max: int = 3
+
     auto_noise: float = 0.01  # 0..1
     auto_blur: float = 0.8
 
@@ -106,6 +110,7 @@ def _tight_ink_bbox(img_L: Image.Image, ink_thresh: int = 250):
 
 
 def _preprocess_for_save(img_L: Image.Image, cfg: CollectConfig, bbox) -> Image.Image:
+    # NOTE: keep pad=0, and then do a tight bbox crop (no extra whitespace)
     cropped = _crop_with_pad(img_L, bbox, pad=0, canvas_size=cfg.canvas_size)
 
     tb = _tight_ink_bbox(cropped, ink_thresh=250)
@@ -351,12 +356,21 @@ def render_text_to_canvas_image(text: str, cfg: CollectConfig, font_path: Option
     glyph = Image.new("L", (gw, gh), 255)
     gd = ImageDraw.Draw(glyph)
 
-    thick = max(1, int(cfg.auto_thicken))
+    # NEW: random thickness from range (overdraw passes)
+    tmin = max(1, int(cfg.auto_thicken_min))
+    tmax = max(1, int(cfg.auto_thicken_max))
+    if tmax < tmin:
+        tmin, tmax = tmax, tmin
+    thick = random.randint(tmin, tmax)
+
+    # thicker => larger jitter so it actually looks thicker
+    jitter = 1 if thick <= 2 else 2 if thick <= 4 else 3
+
     base_x = pad - bbox[0]
     base_y = pad - bbox[1]
     for _ in range(thick):
-        ox = random.randint(-1, 1)
-        oy = random.randint(-1, 1)
+        ox = random.randint(-jitter, jitter)
+        oy = random.randint(-jitter, jitter)
         gd.text((base_x + ox, base_y + oy), text, fill=0, font=font)
 
     if cfg.auto_blur and cfg.auto_blur > 0:
@@ -491,7 +505,7 @@ class CollectorApp:
         )
         self.preview_chk.grid(row=2, column=0, sticky="w", padx=10)
 
-        # NEW: Stop-after-sequential checkbox (GUI toggle)
+        # Stop-after-sequential checkbox (GUI toggle)
         self.stop_after_seq_var = tk.BooleanVar(
             value=bool(self.cfg.auto_stop_after_sequential_cycle))
         self.stop_after_seq_chk = tk.Checkbutton(
@@ -504,9 +518,64 @@ class CollectorApp:
         )
         self.stop_after_seq_chk.grid(row=2, column=1, sticky="w", padx=10)
 
+        # NEW: Pen width for manual drawing
+        tk.Label(self.root, text="Pen width:", font=self.ui_font).grid(
+            row=2, column=2, sticky="e", padx=(10, 4)
+        )
+        self.stroke_width_var = tk.IntVar(value=int(self.cfg.stroke_width))
+        self.stroke_width_spin = tk.Spinbox(
+            self.root,
+            from_=1, to=64,
+            textvariable=self.stroke_width_var,
+            width=6,
+            font=self.ui_font,
+            command=self._on_stroke_width_change
+        )
+        self.stroke_width_spin.grid(row=2, column=3, sticky="w", padx=(0, 10))
+        self.stroke_width_var.trace_add(
+            "write", lambda *_: self._on_stroke_width_change())
+
+        # NEW: Auto thickness range (random)
+        tk.Label(self.root, text="Auto thickness:", font=self.ui_font).grid(
+            row=2, column=4, sticky="e", padx=(10, 4)
+        )
+        self.auto_thick_min_var = tk.IntVar(
+            value=int(self.cfg.auto_thicken_min))
+        self.auto_thick_max_var = tk.IntVar(
+            value=int(self.cfg.auto_thicken_max))
+
+        self.auto_thick_min_spin = tk.Spinbox(
+            self.root,
+            from_=1, to=12,
+            textvariable=self.auto_thick_min_var,
+            width=4,
+            font=self.ui_font,
+            command=self._on_auto_thick_range_change
+        )
+        self.auto_thick_min_spin.grid(row=2, column=5, sticky="w", padx=(0, 4))
+
+        tk.Label(self.root, text="..", font=self.ui_font).grid(
+            row=2, column=6, sticky="w")
+
+        self.auto_thick_max_spin = tk.Spinbox(
+            self.root,
+            from_=1, to=12,
+            textvariable=self.auto_thick_max_var,
+            width=4,
+            font=self.ui_font,
+            command=self._on_auto_thick_range_change
+        )
+        self.auto_thick_max_spin.grid(
+            row=2, column=7, sticky="w", padx=(4, 10))
+
+        self.auto_thick_min_var.trace_add(
+            "write", lambda *_: self._on_auto_thick_range_change())
+        self.auto_thick_max_var.trace_add(
+            "write", lambda *_: self._on_auto_thick_range_change())
+
         self.status_var = tk.StringVar(value=f"Output: {self.cfg.out_dir}")
         tk.Label(self.root, textvariable=self.status_var, font=self.ui_font).grid(
-            row=2, column=2, columnspan=9, padx=10, pady=(6, 2), sticky="w"
+            row=2, column=8, columnspan=3, padx=10, pady=(6, 2), sticky="w"
         )
 
         self.current_token_var = tk.StringVar(value="Current token: (none)")
@@ -521,8 +590,7 @@ class CollectorApp:
 
         if self.auto_font_path is None:
             self.status_var.set(
-                "Warning: auto font not found. Pass --auto_font_ttf for reliable Japanese rendering."
-            )
+                "Warning: auto font not found. Pass --auto_font_ttf for reliable Japanese rendering.")
 
         self.label_entry.focus_set()
 
@@ -540,6 +608,39 @@ class CollectorApp:
 
         self._tk_preview: Optional[ImageTk.PhotoImage] = None
         self._canvas_preview_id: Optional[int] = None
+
+        # ensure current GUI values are applied to cfg
+        self._on_stroke_width_change()
+        self._on_auto_thick_range_change()
+
+    # ---- GUI callbacks ----
+
+    def _on_stroke_width_change(self):
+        try:
+            w = int(self.stroke_width_var.get())
+        except Exception:
+            return
+        w = max(1, min(64, w))
+        self.cfg.stroke_width = w
+
+    def _on_auto_thick_range_change(self):
+        try:
+            mn = int(self.auto_thick_min_var.get())
+            mx = int(self.auto_thick_max_var.get())
+        except Exception:
+            return
+        mn = max(1, min(12, mn))
+        mx = max(1, min(12, mx))
+        if mx < mn:
+            mn, mx = mx, mn
+            # normalize UI values
+            try:
+                self.auto_thick_min_var.set(mn)
+                self.auto_thick_max_var.set(mx)
+            except Exception:
+                pass
+        self.cfg.auto_thicken_min = mn
+        self.cfg.auto_thicken_max = mx
 
     # ---- manual drawing ----
 
@@ -630,7 +731,8 @@ class CollectorApp:
         mode = self.mode_var.get().strip().lower()
         if mode == "sequential" and self._seq_current_total > 0:
             self.current_token_var.set(
-                f"Current token: {token} ({self._seq_current_done}/{self._seq_current_total})")
+                f"Current token: {token} ({self._seq_current_done}/{self._seq_current_total})"
+            )
         else:
             self.current_token_var.set(f"Current token: {token}")
 
@@ -658,7 +760,7 @@ class CollectorApp:
         if should_advance:
             is_last_token = (self._token_index == len(self._tokens) - 1)
 
-            # IMPORTANT: runtime decision uses GUI checkbox state
+            # runtime decision uses GUI checkbox state
             stop_after_seq = bool(self.stop_after_seq_var.get())
 
             if is_last_token and stop_after_seq:
@@ -709,8 +811,7 @@ class CollectorApp:
             return
         if not self.refresh_tokens():
             self.status_var.set(
-                "Error: label list is empty. Put labels (e.g. あ or あ,い,う) then Start."
-            )
+                "Error: label list is empty. Put labels (e.g. あ or あ,い,う) then Start.")
             self.label_entry.focus_set()
             return
 
@@ -721,7 +822,13 @@ class CollectorApp:
         self._auto_running = True
         self._auto_saved = 0
         self.auto_count_var.set(
-            f"Auto: running  saved={self._auto_saved}  mode={self.mode_var.get()}  interval={self.cfg.auto_interval_ms}ms  repeat={self.cfg.auto_repeat_per_token}  stop_after_seq={self.stop_after_seq_var.get()}"
+            "Auto: running"
+            f"  saved={self._auto_saved}"
+            f"  mode={self.mode_var.get()}"
+            f"  interval={self.cfg.auto_interval_ms}ms"
+            f"  repeat={self.cfg.auto_repeat_per_token}"
+            f"  stop_after_seq={self.stop_after_seq_var.get()}"
+            f"  auto_thick={self.cfg.auto_thicken_min}..{self.cfg.auto_thicken_max}"
         )
         self.status_var.set("Auto: started.")
         self._schedule_next_auto(immediate=True)
@@ -755,11 +862,16 @@ class CollectorApp:
                 return
 
             self._auto_saved += 1
-            self.auto_count_var.set(
-                f"Auto: running  saved={self._auto_saved}"
-                + (f" / limit={self.cfg.auto_limit}" if self.cfg.auto_limit > 0 else "")
-                + f"  mode={self.mode_var.get()}  interval={self.cfg.auto_interval_ms}ms  repeat={self.cfg.auto_repeat_per_token}  stop_after_seq={self.stop_after_seq_var.get()}"
-            )
+            parts = [
+                "Auto: running",
+                f"saved={self._auto_saved}",
+                f"mode={self.mode_var.get()}",
+                f"interval={self.cfg.auto_interval_ms}ms",
+                f"repeat={self.cfg.auto_repeat_per_token}",
+                f"stop_after_seq={self.stop_after_seq_var.get()}",
+                f"auto_thick={self.cfg.auto_thicken_min}..{self.cfg.auto_thicken_max}",
+            ]
+            self.auto_count_var.set("  ".join(parts))
 
             if self.cfg.auto_limit > 0 and self._auto_saved >= self.cfg.auto_limit:
                 self.stop_auto()
@@ -862,7 +974,14 @@ def main():
     ap.add_argument("--auto_font_ttf", type=str, default="")
     ap.add_argument("--auto_font_px", type=int, default=180)
     ap.add_argument("--auto_rotate_deg", type=float, default=10.0)
-    ap.add_argument("--auto_thicken", type=int, default=2)
+
+    # NEW: AutoDraw thickness range
+    ap.add_argument("--auto_thicken_min", type=int, default=1)
+    ap.add_argument("--auto_thicken_max", type=int, default=3)
+
+    # Backward compatibility (optional): if you still pass --auto_thicken, it will override min/max
+    ap.add_argument("--auto_thicken", type=int, default=None)
+
     ap.add_argument("--auto_noise", type=float, default=0.01)
     ap.add_argument("--auto_blur", type=float, default=0.8)
 
@@ -900,6 +1019,13 @@ def main():
 
     args = ap.parse_args()
 
+    # Determine auto thickness range with backward compatibility
+    th_min = int(args.auto_thicken_min)
+    th_max = int(args.auto_thicken_max)
+    if args.auto_thicken is not None:
+        th_min = int(args.auto_thicken)
+        th_max = int(args.auto_thicken)
+
     cfg = CollectConfig(
         out_dir=Path(args.out_dir),
         canvas_size=int(args.canvas_size),
@@ -913,7 +1039,10 @@ def main():
         auto_font_ttf=Path(args.auto_font_ttf) if args.auto_font_ttf else None,
         auto_font_px=int(args.auto_font_px),
         auto_rotate_deg=float(args.auto_rotate_deg),
-        auto_thicken=int(args.auto_thicken),
+
+        auto_thicken_min=int(th_min),
+        auto_thicken_max=int(th_max),
+
         auto_noise=float(args.auto_noise),
         auto_blur=float(args.auto_blur),
 
