@@ -11,7 +11,7 @@ import time
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Optional, Tuple, List, Dict, Any, Iterator
 
 import tkinter as tk
 import tkinter.font as tkfont
@@ -82,6 +82,14 @@ class CollectConfig:
     auto_dilate_max: int = 5
     auto_erode_prob: float = 0.35
     auto_edge_blur: float = 0.6
+
+    # --- tomoe (.tdic) mode ---
+    tomoe_tdic_path: Optional[Path] = None
+    tomoe_base_size: int = 320  # tdic coords assumed 0..320
+    tomoe_pen_width_min: int = 10
+    tomoe_pen_width_max: int = 18
+    tomoe_point_jitter: float = 1.4     # px gaussian jitter
+    tomoe_drop_point_prob: float = 0.03  # randomly drop points
 
 
 # ---------------- Utilities ----------------
@@ -392,7 +400,228 @@ def _apply_handwriting_effects(glyph_ink_L: Image.Image, cfg: CollectConfig) -> 
     return _mask_to_ink_image(mask, edge_blur=float(cfg.auto_edge_blur))
 
 
-# ---------------- Auto draw rendering ----------------
+# ---------------- Tomoe (.tdic) parsing / rendering ----------------
+
+TomoePoint = Tuple[float, float]
+TomoeStroke = List[TomoePoint]
+TomoeDict = Dict[str, List[TomoeStroke]]
+
+
+def parse_tdic_file(tdic_path: Path) -> TomoeDict:
+    """
+    Parse tomoe .tdic file into {char: [stroke1_points, stroke2_points, ...]}.
+    Format:
+      <char>
+      :<N>
+      <k> (x y) (x y) ...
+      ... N lines
+      <blank line>
+    """
+    text = tdic_path.read_text(encoding="utf-8", errors="replace")
+    lines = text.splitlines()
+    i = 0
+    out: TomoeDict = {}
+
+    def is_blank(s: str) -> bool:
+        return s.strip() == ""
+
+    while i < len(lines):
+        if is_blank(lines[i]):
+            i += 1
+            continue
+
+        ch = lines[i].strip()
+        if not ch:
+            i += 1
+            continue
+
+        if i + 1 >= len(lines) or not lines[i + 1].startswith(":"):
+            i += 1
+            continue
+
+        try:
+            n = int(lines[i + 1][1:].strip())
+        except Exception:
+            i += 2
+            continue
+
+        i += 2
+        strokes: List[TomoeStroke] = []
+
+        for _ in range(n):
+            if i >= len(lines):
+                break
+            row = lines[i].strip()
+            i += 1
+
+            if not row:
+                strokes.append([])
+                continue
+
+            parts = row.split()
+            pts: TomoeStroke = []
+
+            # parts: ["6","(50","103)","(137","99)", ...]
+            j = 1
+            while j + 1 < len(parts):
+                xs = parts[j].lstrip("(")
+                ys = parts[j + 1].rstrip(")")
+                try:
+                    x = float(xs)
+                    y = float(ys)
+                    pts.append((x, y))
+                except Exception:
+                    pass
+                j += 2
+
+            strokes.append(pts)
+
+        if strokes:
+            out[ch] = strokes
+
+    return out
+
+
+def _jitter_and_drop_points(strokes: List[TomoeStroke], cfg: CollectConfig) -> List[TomoeStroke]:
+    """
+    Add gaussian jitter to each point and randomly drop some points.
+    """
+    jitter = float(getattr(cfg, "tomoe_point_jitter", 0.0))
+    drop_p = float(getattr(cfg, "tomoe_drop_point_prob", 0.0))
+
+    new_strokes: List[TomoeStroke] = []
+    for st in strokes:
+        if not st:
+            new_strokes.append([])
+            continue
+
+        pts: TomoeStroke = []
+        for (x, y) in st:
+            if drop_p > 0 and random.random() < drop_p:
+                continue
+            if jitter > 0:
+                x = x + random.gauss(0.0, jitter)
+                y = y + random.gauss(0.0, jitter)
+            pts.append((x, y))
+
+        # keep at least 2 points if it was originally a line stroke
+        if len(pts) == 1 and len(st) >= 2:
+            pts.append(pts[0])
+
+        new_strokes.append(pts)
+
+    return new_strokes
+
+
+def render_tomoe_strokes_to_canvas_image(strokes: List[TomoeStroke], cfg: CollectConfig) -> Image.Image:
+    """
+    Render tomoe strokes to a 320x320 base, apply handwriting-like effects,
+    then scale/position/rotate/noise into cfg.canvas_size.
+    Output is L image with white background and black ink, same as auto font rendering.
+    """
+    base_size = int(getattr(cfg, "tomoe_base_size", 320))
+    base = Image.new("L", (base_size, base_size), 255)
+    d = ImageDraw.Draw(base)
+
+    # jitter/drop points to simulate handwriting variance
+    strokes2 = _jitter_and_drop_points(strokes, cfg)
+
+    wmin = int(getattr(cfg, "tomoe_pen_width_min",
+               max(1, cfg.stroke_width - 4)))
+    wmax = int(getattr(cfg, "tomoe_pen_width_max", cfg.stroke_width + 4))
+    if wmax < wmin:
+        wmin, wmax = wmax, wmin
+
+    # draw each stroke with a slightly different pen width
+    for st in strokes2:
+        if len(st) >= 2:
+            pen_w = random.randint(max(1, wmin), max(1, wmax))
+            pts = [(float(x), float(y)) for (x, y) in st]
+            d.line(pts, fill=0, width=pen_w, joint="curve")
+        elif len(st) == 1:
+            pen_w = random.randint(max(1, wmin), max(1, wmax))
+            x, y = st[0]
+            r = max(1, pen_w // 2)
+            d.ellipse((x - r, y - r, x + r, y + r), fill=0)
+
+    # crop tight bbox
+    tb = _tight_ink_bbox(base, ink_thresh=250)
+    if tb is None:
+        return Image.new("L", (cfg.canvas_size, cfg.canvas_size), 255)
+
+    glyph = base.crop(tb)
+
+    # blur then handwriting effects (pressure/elastic/edge)
+    if cfg.auto_blur and cfg.auto_blur > 0:
+        glyph = glyph.filter(ImageFilter.GaussianBlur(
+            radius=float(cfg.auto_blur)))
+
+    glyph = _apply_handwriting_effects(glyph, cfg)
+
+    # fit into target canvas with margin
+    canvas = Image.new("L", (cfg.canvas_size, cfg.canvas_size), 255)
+
+    max_side_w = cfg.canvas_size - cfg.auto_margin_px * 2
+    max_side_h = cfg.canvas_size - cfg.auto_margin_px * 2
+    if glyph.size[0] > max_side_w or glyph.size[1] > max_side_h:
+        sx = max_side_w / float(glyph.size[0])
+        sy = max_side_h / float(glyph.size[1])
+        sc = max(0.05, min(sx, sy))
+        nw = max(1, int(round(glyph.size[0] * sc)))
+        nh = max(1, int(round(glyph.size[1] * sc)))
+        glyph = glyph.resize((nw, nh), resample=Image.Resampling.BILINEAR)
+
+    # optional extra scale variance like font mode
+    smin = min(cfg.auto_scale_min, cfg.auto_scale_max)
+    smax = max(cfg.auto_scale_min, cfg.auto_scale_max)
+    sc2 = random.uniform(smin, smax)
+    if abs(sc2 - 1.0) > 1e-6:
+        nw2 = max(1, int(round(glyph.size[0] * sc2)))
+        nh2 = max(1, int(round(glyph.size[1] * sc2)))
+        glyph = glyph.resize((nw2, nh2), resample=Image.Resampling.BILINEAR)
+        # re-fit if it exceeded margins
+        max_side_w2 = cfg.canvas_size - cfg.auto_margin_px * 2
+        max_side_h2 = cfg.canvas_size - cfg.auto_margin_px * 2
+        if glyph.size[0] > max_side_w2 or glyph.size[1] > max_side_h2:
+            sx = max_side_w2 / float(glyph.size[0])
+            sy = max_side_h2 / float(glyph.size[1])
+            sc = max(0.05, min(sx, sy))
+            nw = max(1, int(round(glyph.size[0] * sc)))
+            nh = max(1, int(round(glyph.size[1] * sc)))
+            glyph = glyph.resize((nw, nh), resample=Image.Resampling.BILINEAR)
+
+    max_x = (cfg.canvas_size - cfg.auto_margin_px) - glyph.size[0]
+    max_y = (cfg.canvas_size - cfg.auto_margin_px) - glyph.size[1]
+    min_x = cfg.auto_margin_px
+    min_y = cfg.auto_margin_px
+    if max_x < min_x:
+        x = max(0, (cfg.canvas_size - glyph.size[0]) // 2)
+    else:
+        x = random.randint(min_x, max_x)
+    if max_y < min_y:
+        y = max(0, (cfg.canvas_size - glyph.size[1]) // 2)
+    else:
+        y = random.randint(min_y, max_y)
+
+    canvas.paste(glyph, (x, y))
+
+    # rotate
+    if cfg.auto_rotate_deg and cfg.auto_rotate_deg > 0:
+        deg = random.uniform(-cfg.auto_rotate_deg, cfg.auto_rotate_deg)
+        canvas = canvas.rotate(
+            deg,
+            resample=Image.Resampling.BILINEAR,
+            expand=False,
+            fillcolor=255
+        )
+
+    # noise
+    canvas = _add_salt_noise(canvas, cfg.auto_noise)
+
+    return canvas
+
+
+# ---------------- Auto draw rendering (font) ----------------
 
 def render_text_to_canvas_image(text: str, cfg: CollectConfig, font_paths: List[Path]) -> Image.Image:
     canvas = Image.new("L", (cfg.canvas_size, cfg.canvas_size), 255)
@@ -492,6 +721,10 @@ class CollectorApp:
         self.auto_font_paths = resolve_auto_font_paths(self.cfg)
         self.ui_font = pick_jp_font(self.root, size=self.cfg.font_size)
 
+        # Tomoe cache
+        self._tomoe_dict: TomoeDict = {}
+        self._tomoe_loaded_from: Optional[Path] = None
+
         self.canvas = tk.Canvas(
             self.root,
             width=cfg.canvas_size,
@@ -563,12 +796,10 @@ class CollectorApp:
         )
         self.preview_chk.grid(row=2, column=0, sticky="w", padx=10)
 
-        # Load TXT button (row=2 to avoid collisions)
         tk.Button(self.root, text="Load TXT", command=self.load_labels_from_txt, font=self.ui_font).grid(
             row=2, column=1, sticky="w", padx=10
         )
 
-        # Stop-after-sequential checkbox
         self.stop_after_seq_var = tk.BooleanVar(
             value=bool(self.cfg.auto_stop_after_sequential_cycle))
         self.stop_after_seq_chk = tk.Checkbutton(
@@ -581,7 +812,6 @@ class CollectorApp:
         )
         self.stop_after_seq_chk.grid(row=2, column=2, sticky="w", padx=10)
 
-        # Pen width for manual drawing
         tk.Label(self.root, text="Pen width:", font=self.ui_font).grid(
             row=2, column=3, sticky="e", padx=(10, 4)
         )
@@ -598,7 +828,6 @@ class CollectorApp:
         self.stroke_width_var.trace_add(
             "write", lambda *_: self._on_stroke_width_change())
 
-        # Auto thickness range
         tk.Label(self.root, text="Auto thickness:", font=self.ui_font).grid(
             row=2, column=5, sticky="e", padx=(10, 4)
         )
@@ -636,25 +865,59 @@ class CollectorApp:
         self.auto_thick_max_var.trace_add(
             "write", lambda *_: self._on_auto_thick_range_change())
 
+        # Auto source (font / tomoe)
+        tk.Label(self.root, text="Auto source:", font=self.ui_font).grid(
+            row=2, column=9, sticky="e", padx=(6, 2)
+        )
+        self.auto_source_var = tk.StringVar(value="font")
+        self.auto_source_menu = tk.OptionMenu(
+            self.root, self.auto_source_var, "font", "tomoe")
+        self.auto_source_menu.configure(font=self.ui_font)
+        self.auto_source_menu.grid(row=2, column=10, sticky="ew", padx=(2, 10))
+
         self.status_var = tk.StringVar(value=f"Output: {self.cfg.out_dir}")
         tk.Label(self.root, textvariable=self.status_var, font=self.ui_font).grid(
             row=3, column=0, columnspan=11, padx=10, pady=(6, 2), sticky="w"
         )
 
+        # Tomoe tdic path controls (row 4)
+        tk.Label(self.root, text="Tomoe .tdic:", font=self.ui_font).grid(
+            row=4, column=0, sticky="w", padx=10
+        )
+        self.tomoe_path_var = tk.StringVar(
+            value=str(self.cfg.tomoe_tdic_path) if self.cfg.tomoe_tdic_path else "")
+        self.tomoe_path_entry = tk.Entry(
+            self.root, textvariable=self.tomoe_path_var, width=60, font=self.ui_font
+        )
+        self.tomoe_path_entry.grid(
+            row=4, column=1, columnspan=8, sticky="ew", padx=10)
+
+        tk.Button(self.root, text="Browse", command=self.browse_tomoe_tdic, font=self.ui_font).grid(
+            row=4, column=9, sticky="ew", padx=6
+        )
+        tk.Button(self.root, text="Load", command=self.load_tomoe_tdic_from_entry, font=self.ui_font).grid(
+            row=4, column=10, sticky="ew", padx=(6, 10)
+        )
+
         self.current_token_var = tk.StringVar(value="Current token: (none)")
         tk.Label(self.root, textvariable=self.current_token_var, font=self.ui_font).grid(
-            row=4, column=0, columnspan=11, padx=10, pady=(0, 2), sticky="w"
+            row=5, column=0, columnspan=11, padx=10, pady=(0, 2), sticky="w"
         )
 
         self.auto_count_var = tk.StringVar(value="Auto: stopped")
         tk.Label(self.root, textvariable=self.auto_count_var, font=self.ui_font).grid(
-            row=5, column=0, columnspan=11, padx=10, pady=(0, 10), sticky="w"
+            row=6, column=0, columnspan=11, padx=10, pady=(0, 10), sticky="w"
         )
 
         if not self.auto_font_paths:
             self.status_var.set(
                 "Warning: auto font not found. Use --auto_font_ttf or --auto_font_ttf_list for reliable Japanese rendering."
             )
+
+        # If tdic path provided at startup, try load silently (no popup)
+        if self.tomoe_path_var.get().strip():
+            self._try_load_tomoe(
+                Path(self.tomoe_path_var.get().strip()), quiet=True)
 
         self.label_entry.focus_set()
 
@@ -674,6 +937,57 @@ class CollectorApp:
 
         self._on_stroke_width_change()
         self._on_auto_thick_range_change()
+
+    # ---- tomoe load helpers ----
+
+    def browse_tomoe_tdic(self):
+        path = filedialog.askopenfilename(
+            title="Select a .tdic file",
+            filetypes=[("Tomoe dictionary", "*.tdic"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        self.tomoe_path_var.set(path)
+        self.load_tomoe_tdic_from_entry()
+
+    def load_tomoe_tdic_from_entry(self):
+        s = self.tomoe_path_var.get().strip()
+        if not s:
+            messagebox.showwarning("Tomoe", "Please set .tdic path first.")
+            return
+        p = Path(s)
+        ok = self._try_load_tomoe(p, quiet=False)
+        if ok:
+            self.status_var.set(
+                f"Tomoe loaded: {p.name}  chars={len(self._tomoe_dict)}")
+
+    def _try_load_tomoe(self, p: Path, quiet: bool) -> bool:
+        if not p.exists():
+            if not quiet:
+                messagebox.showerror("Tomoe", f"File not found:\n{p}")
+            return False
+        try:
+            d = parse_tdic_file(p)
+        except Exception as e:
+            if not quiet:
+                messagebox.showerror("Tomoe", f"Failed to parse .tdic:\n{e}")
+            return False
+        if not d:
+            if not quiet:
+                messagebox.showerror("Tomoe", f"No glyphs parsed from:\n{p}")
+            return False
+        self._tomoe_dict = d
+        self._tomoe_loaded_from = p
+        self.cfg.tomoe_tdic_path = p
+        return True
+
+    def _ensure_tomoe_loaded(self) -> bool:
+        if self._tomoe_dict:
+            return True
+        s = self.tomoe_path_var.get().strip()
+        if not s:
+            return False
+        return self._try_load_tomoe(Path(s), quiet=True)
 
     # ---- load labels from txt (METHOD) ----
 
@@ -814,7 +1128,8 @@ class CollectorApp:
         self._tk_preview = ImageTk.PhotoImage(rgb)
         self.canvas.delete("all")
         self._canvas_preview_id = self.canvas.create_image(
-            0, 0, anchor="nw", image=self._tk_preview)
+            0, 0, anchor="nw", image=self._tk_preview
+        )
 
     # ---- token selection ----
 
@@ -874,6 +1189,25 @@ class CollectorApp:
 
     # ---- auto draw ----
 
+    def _render_autodraw_token(self, token: str) -> Optional[Image.Image]:
+        src = self.auto_source_var.get().strip().lower()
+
+        if src == "tomoe":
+            if not self._ensure_tomoe_loaded():
+                self.status_var.set(
+                    "Tomoe: .tdic not loaded (set path and press Load, or switch Auto source to font).")
+                return None
+            strokes = self._tomoe_dict.get(token)
+            if strokes is None:
+                # fallback to font (common if token list includes items not in tdic)
+                self.status_var.set(
+                    f"Tomoe: token '{token}' not found in tdic; fallback to font.")
+                return render_text_to_canvas_image(token, self.cfg, self.auto_font_paths)
+            return render_tomoe_strokes_to_canvas_image(strokes, self.cfg)
+
+        # default: font
+        return render_text_to_canvas_image(token, self.cfg, self.auto_font_paths)
+
     def auto_draw_and_save(self) -> bool:
         picked = self.pick_text_for_autodraw()
         if not picked:
@@ -886,8 +1220,12 @@ class CollectorApp:
 
         self._update_current_token_label(token)
 
-        self.img = render_text_to_canvas_image(
-            token, self.cfg, self.auto_font_paths)
+        img = self._render_autodraw_token(token)
+        if img is None:
+            self.label_entry.focus_set()
+            return False
+
+        self.img = img
         self.draw = ImageDraw.Draw(self.img)
 
         tb = _tight_ink_bbox(self.img, ink_thresh=250)
@@ -913,12 +1251,15 @@ class CollectorApp:
             parts.append(f"/ limit={self.cfg.auto_limit}")
         parts += [
             f"mode={self.mode_var.get()}",
+            f"source={self.auto_source_var.get()}",
             f"interval={self.cfg.auto_interval_ms}ms",
             f"repeat={self.cfg.auto_repeat_per_token}",
             f"stop_after_seq={self.stop_after_seq_var.get()}",
             f"auto_thick={self.cfg.auto_thicken_min}..{self.cfg.auto_thicken_max}",
             f"fonts={len(self.auto_font_paths)}",
         ]
+        if self.auto_source_var.get().strip().lower() == "tomoe":
+            parts.append(f"tdic_loaded={len(self._tomoe_dict)}")
         self.auto_count_var.set("  ".join(parts))
 
     def start_auto(self):
@@ -934,6 +1275,10 @@ class CollectorApp:
         self._token_index = 0
         self._seq_current_total = 0
         self._seq_current_done = 0
+
+        # If tomoe source, try load early to fail fast (no popup)
+        if self.auto_source_var.get().strip().lower() == "tomoe":
+            self._ensure_tomoe_loaded()
 
         self._auto_running = True
         self._auto_saved = 0
@@ -1056,6 +1401,53 @@ def batch_generate(cfg: CollectConfig, texts: List[str], per_text: int):
     print(f"Done. saved={count}  out_dir={cfg.out_dir}")
 
 
+def batch_generate_from_tomoe_tdic(
+    cfg: CollectConfig,
+    tdic_path: Path,
+    per_char: int,
+    only_tokens: Optional[List[str]] = None
+):
+    cfg.out_dir.mkdir(parents=True, exist_ok=True)
+    (cfg.out_dir / "images").mkdir(parents=True, exist_ok=True)
+    labels_path = cfg.out_dir / "labels.jsonl"
+
+    data = parse_tdic_file(tdic_path)
+    if not data:
+        raise SystemExit(f"No glyphs parsed from: {tdic_path}")
+
+    keys = sorted(data.keys())
+    if only_tokens:
+        wanted = set(only_tokens)
+        keys = [k for k in keys if k in wanted]
+
+    count = 0
+    for ch in keys:
+        strokes = data.get(ch)
+        if not strokes:
+            continue
+
+        for _ in range(max(1, int(per_char))):
+            img = render_tomoe_strokes_to_canvas_image(strokes, cfg)
+            tb = _tight_ink_bbox(img, ink_thresh=250)
+            if tb is None:
+                continue
+            out_img = _preprocess_for_save(img, cfg, tb)
+
+            uid = f"{_now_id()}_{count:06d}"
+            rel = Path("images") / f"{uid}.png"
+            abs_path = cfg.out_dir / rel
+            out_img.save(abs_path)
+
+            rec = {"path": str(rel).replace("\\", "/"), "text": ch}
+            with labels_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+            count += 1
+
+    print(
+        f"Done. tomoe saved={count}  out_dir={cfg.out_dir}  tdic={tdic_path}")
+
+
 # ---------------- CLI ----------------
 
 def _parse_font_list_arg(s: str) -> List[Path]:
@@ -1133,9 +1525,27 @@ def main():
     ap.add_argument("--auto_erode_prob", type=float, default=0.35)
     ap.add_argument("--auto_edge_blur", type=float, default=0.6)
 
+    # batch
     ap.add_argument("--batch", action="store_true")
     ap.add_argument("--texts", type=str, default="")
     ap.add_argument("--per_text", type=int, default=20)
+
+    # tomoe batch
+    ap.add_argument("--tomoe", action="store_true",
+                    help="Use Tomoe .tdic as source in batch mode")
+    ap.add_argument("--tomoe_tdic", type=str, default="",
+                    help="Path to .tdic (e.g. hiragana.tdic)")
+    ap.add_argument("--tomoe_per_char", type=int, default=200,
+                    help="How many augmented samples per char for Tomoe")
+
+    ap.add_argument("--tomoe_pen_width_min", type=int, default=10)
+    ap.add_argument("--tomoe_pen_width_max", type=int, default=18)
+    ap.add_argument("--tomoe_point_jitter", type=float, default=1.4)
+    ap.add_argument("--tomoe_drop_point_prob", type=float, default=0.03)
+
+    # tomoe for GUI default path (optional)
+    ap.add_argument("--tomoe_tdic_gui", type=str, default="",
+                    help="Default .tdic path in GUI (optional)")
 
     args = ap.parse_args()
 
@@ -1195,9 +1605,37 @@ def main():
         auto_dilate_max=int(args.auto_dilate_max),
         auto_erode_prob=float(args.auto_erode_prob),
         auto_edge_blur=float(args.auto_edge_blur),
+
+        tomoe_tdic_path=Path(
+            args.tomoe_tdic_gui) if args.tomoe_tdic_gui else None,
+        tomoe_pen_width_min=int(args.tomoe_pen_width_min),
+        tomoe_pen_width_max=int(args.tomoe_pen_width_max),
+        tomoe_point_jitter=float(args.tomoe_point_jitter),
+        tomoe_drop_point_prob=float(args.tomoe_drop_point_prob),
     )
 
     if args.batch:
+        if args.tomoe:
+            if not args.tomoe_tdic.strip():
+                raise SystemExit(
+                    "--batch --tomoe requires --tomoe_tdic (e.g. path/to/hiragana.tdic)")
+            tdic_path = Path(args.tomoe_tdic)
+            if not tdic_path.exists():
+                raise SystemExit(f"tomoe_tdic not found: {tdic_path}")
+
+            only_tokens = None
+            if args.texts.strip():
+                only_tokens = _parse_label_tokens(args.texts)
+
+            batch_generate_from_tomoe_tdic(
+                cfg,
+                tdic_path=tdic_path,
+                per_char=int(args.tomoe_per_char),
+                only_tokens=only_tokens,
+            )
+            return
+
+        # default font batch
         if not args.texts.strip():
             raise SystemExit(
                 "--batch requires --texts (comma/space/、-separated). e.g. --texts あ,い,う,え,お")

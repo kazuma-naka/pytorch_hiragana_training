@@ -70,6 +70,15 @@ python3 train_hiragana_crnn_ctc.py   --data_dir dataset_hira   --labels dataset_
 python3 collect_hiragana_tk.py --auto_elastic_alpha 18 --auto_elastic_sigma 6 --auto_scale_min 0.5 --auto_scale_max 2 --auto_erode_prob 0 --auto_edge_blur 0 --auto_elastic_prob 0 --auto_pressure_prob 0 --auto_blur 0 --auto_interval_ms 1 --auto_repeat_per_token 2000 --auto_thicken_min 2 --auto_thicken_max 4 --auto_noise 0 --auto_font_ttf_list "$(printf '%s ' fonts/*.ttf fonts/*.otf 2>/dev/null)"
 ```
 
+```bash
+python3 collect_hiragana_tk.py --batch --tomoe --tomoe_tdic tomoe_data/hiragana.tdic --tomoe_per_char 200 --out_dir dataset_tomoe_hira --target_h 32 --max_w 512 --tomoe_pen_width_min 14 --tomoe_pen_width_max 22 --tomoe_point_jitter 0.6 --tomoe_drop_point_prob 0 --auto_pressure_prob 0 --auto_elastic_prob 0.2 --auto_elastic_alpha 6 --auto_elastic_sigma 3 --auto_erode_prob 0 --auto_edge_blur 0.2 --auto_blur 0.3 --auto_rotate_deg 2 --auto_noise 0.002
+```
+
+```bash
+python3 train_hiragana_crnn_ctc.py --data_dir dataset_tomoe_hira --labels dataset_tomoe_hira/labels.jsonl --out_dir runs/hira_ctc_from_dataset_tomoe_hira --epochs 200 --batch_size 32 --lr 1e-3 --device cpu
+
+```
+
 学習のポイント：
 
 - 入力画像は **高さ 32 に正規化**、幅は可変（最大 512 まで）
@@ -89,6 +98,12 @@ python3 collect_hiragana_tk.py --auto_elastic_alpha 18 --auto_elastic_sigma 6 --
 
 ```bash
 python3 draw_infer_hiragana_ctc_tk_learn.py --model runs/hira_ctc_from_dataset_hira/model_torchscript.pt --vocab runs/hira_ctc_from_dataset_hira/vocab.json
+```
+
+
+```bash
+python3 draw_infer_hiragana_ctc_tk_learn.py --model runs/hira_ctc_from_dataset_tomoe_hira/model_torchscript.pt --vocab runs/hira_ctc_from_dataset_tomoe_hira/vocab.json
+
 ```
 
 - 画面にひらがなを描いて `Infer`
