@@ -56,6 +56,10 @@ python collect_hiragana_tk.py --out_dir dataset_hira
 
 ---
 
+```
+python3 build_dataset_from_android_pictures.py --src_root exported/Pictures/MyHandwriteApp --out_dir dataset_hira --prefix label_ --target_h 32 --max_w 512 --ink_thresh 245 --pad 0 --blur 0.0
+```
+
 #### 2) 学習（CRNN + CTC）
 
 ```bash
