@@ -79,6 +79,13 @@ python3 train_hiragana_crnn_ctc.py --data_dir dataset_tomoe_hira --labels datase
 
 ```
 
+```bash
+
+python3 train_hiragana_crnn_ctc.py --dataset dataset_hira:dataset_hira/labels.jsonl --dataset dataset_tomoe_hira:dataset_tomoe_hira/labels.jsonl --out_dir runs/hira_ctc_multi --epochs 200 --batch_size 32 --lr 1e-3 --device cuda
+
+
+```
+
 学習のポイント：
 
 - 入力画像は **高さ 32 に正規化**、幅は可変（最大 512 まで）
@@ -99,7 +106,6 @@ python3 train_hiragana_crnn_ctc.py --data_dir dataset_tomoe_hira --labels datase
 ```bash
 python3 draw_infer_hiragana_ctc_tk_learn.py --model runs/hira_ctc_from_dataset_hira/model_torchscript.pt --vocab runs/hira_ctc_from_dataset_hira/vocab.json
 ```
-
 
 ```bash
 python3 draw_infer_hiragana_ctc_tk_learn.py --model runs/hira_ctc_from_dataset_tomoe_hira/model_torchscript.pt --vocab runs/hira_ctc_from_dataset_tomoe_hira/vocab.json

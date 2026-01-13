@@ -10,7 +10,7 @@ import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 from PIL import Image
@@ -98,30 +98,70 @@ def estimate_valid_width_from_image_L(img_L: Image.Image, ink_thresh: int = 245)
     return int(idx[-1]) + 1
 
 
-class JsonlHandwritingDataset(Dataset):
-    def __init__(self, root: Path, labels_jsonl: Path, ink_thresh: int = 245):
-        self.root = root
+def _resolve_labels_path(root: Path, labels: Path) -> Path:
+    """
+    Resolve labels path robustly:
+    - If labels is absolute or exists as given -> use it
+    - Else try root / labels
+    """
+    labels = Path(labels)
+    if labels.is_file():
+        return labels
+    cand = root / labels
+    if cand.is_file():
+        return cand
+    return labels  # will be validated later
+
+
+class MultiJsonlHandwritingDataset(Dataset):
+    """
+    Combine multiple datasets: each dataset is (root_dir, labels_jsonl_path).
+    Each jsonl line must contain:
+      - "path": relative path to image within root_dir (or a path that works under root_dir)
+      - "text": label string
+    """
+
+    def __init__(self, datasets: List[Tuple[Path, Path]], ink_thresh: int = 245):
         self.ink_thresh = int(ink_thresh)
-        self.items: List[Tuple[Path, str]] = []
-        with labels_jsonl.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                obj = json.loads(line)
-                rel = Path(obj["path"])
-                text = str(obj["text"])
-                self.items.append((rel, text))
+        self.items: List[Tuple[Path, Path, str]] = []  # (root, rel_path, text)
+
+        if not datasets:
+            raise RuntimeError("No datasets provided.")
+
+        for root, labels_jsonl in datasets:
+            root = Path(root)
+            labels_jsonl = _resolve_labels_path(root, Path(labels_jsonl))
+
+            if not root.is_dir():
+                raise RuntimeError(f"dataset root dir not found: {root}")
+            if not labels_jsonl.is_file():
+                raise RuntimeError(f"labels jsonl not found: {labels_jsonl}")
+
+            with labels_jsonl.open("r", encoding="utf-8") as f:
+                for line_no, line in enumerate(f, start=1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception as e:
+                        raise RuntimeError(
+                            f"JSON parse error in {labels_jsonl} at line {line_no}: {e}"
+                        )
+                    rel = Path(obj["path"])
+                    text = str(obj["text"])
+                    self.items.append((root, rel, text))
 
         if not self.items:
-            raise RuntimeError(f"No samples found in {labels_jsonl}")
+            raise RuntimeError(
+                "No samples found across all provided datasets.")
 
     def __len__(self) -> int:
         return len(self.items)
 
     def __getitem__(self, idx: int):
-        rel, text = self.items[idx]
-        img_path = self.root / rel
+        root, rel, text = self.items[idx]
+        img_path = root / rel
         img = Image.open(img_path).convert("L")  # white bg, black ink
 
         valid_w = estimate_valid_width_from_image_L(
@@ -292,8 +332,11 @@ class EpochProgress:
 
 @dataclass
 class TrainConfig:
+    # if datasets is empty, fall back to data_dir/labels
+    datasets: List[Tuple[Path, Path]]
     data_dir: Path
     labels: Path
+
     out_dir: Path
     epochs: int = 10
     batch_size: int = 32
@@ -316,10 +359,46 @@ class TrainConfig:
     progress_seconds: float = 2.0
 
 
+def parse_dataset_spec(s: str) -> Tuple[Path, Path]:
+    """
+    --dataset ROOT:LABELS_JSONL (repeatable)
+    Example:
+      --dataset dataset_hira:dataset_hira/labels.jsonl
+      --dataset dataset_tomoe_hira:dataset_tomoe_hira/labels.jsonl
+    """
+    if ":" not in s:
+        raise argparse.ArgumentTypeError(
+            f"--dataset must be in 'ROOT:LABELS_JSONL' format, got: {s}"
+        )
+    root_s, labels_s = s.split(":", 1)
+    root = Path(root_s)
+    labels = Path(labels_s)
+
+    # If labels doesn't exist as given, try root/labels
+    labels2 = _resolve_labels_path(root, labels)
+
+    # Validate early for better UX
+    if not root.is_dir():
+        raise argparse.ArgumentTypeError(f"dataset root dir not found: {root}")
+    if not labels2.is_file():
+        raise argparse.ArgumentTypeError(f"labels jsonl not found: {labels2}")
+
+    return root, labels2
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data_dir", type=str, default="dataset_hira")
-    ap.add_argument("--labels", type=str, default="dataset_hira/labels.jsonl")
+
+    # Backward compatible single-dataset args (still usable)
+    ap.add_argument("--data_dir", type=str, default="dataset_hira",
+                    help="(legacy) Single dataset root dir. If --dataset is provided, this is ignored.")
+    ap.add_argument("--labels", type=str, default="dataset_hira/labels.jsonl",
+                    help="(legacy) Single labels jsonl. If --dataset is provided, this is ignored.")
+
+    # New multi-dataset arg
+    ap.add_argument("--dataset", type=parse_dataset_spec, action="append", default=[],
+                    help="Repeatable dataset spec: ROOT:LABELS_JSONL. If provided, overrides --data_dir/--labels.")
+
     ap.add_argument("--out_dir", type=str, default="runs/hira_ctc")
     ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--batch_size", type=int, default=32)
@@ -347,7 +426,17 @@ def main():
 
     args = ap.parse_args()
 
+    # datasets: if --dataset is provided, use it; else fallback to legacy
+    datasets: List[Tuple[Path, Path]] = []
+    if args.dataset:
+        datasets = list(args.dataset)
+    else:
+        root = Path(args.data_dir)
+        labels = _resolve_labels_path(root, Path(args.labels))
+        datasets = [(root, labels)]
+
     cfg = TrainConfig(
+        datasets=datasets,
         data_dir=Path(args.data_dir),
         labels=Path(args.labels),
         out_dir=Path(args.out_dir),
@@ -379,16 +468,17 @@ def main():
     with vocab_path.open("w", encoding="utf-8") as f:
         json.dump({"itos": vocab.itos}, f, ensure_ascii=False, indent=2)
 
-    ds = JsonlHandwritingDataset(
-        root=cfg.data_dir, labels_jsonl=cfg.labels, ink_thresh=cfg.ink_thresh)
+    # Build combined dataset
+    ds = MultiJsonlHandwritingDataset(
+        datasets=cfg.datasets, ink_thresh=cfg.ink_thresh)
     train_idx, val_idx = split_indices(len(ds), cfg.val_ratio, cfg.seed)
 
+    # Create subset views without re-reading jsonl files
     train_items = [ds.items[i] for i in train_idx]
     val_items = [ds.items[i] for i in val_idx]
 
-    class _Subset(JsonlHandwritingDataset):
-        def __init__(self, root, items, ink_thresh: int):
-            self.root = root
+    class _Subset(Dataset):
+        def __init__(self, items: List[Tuple[Path, Path, str]], ink_thresh: int):
             self.items = items
             self.ink_thresh = int(ink_thresh)
 
@@ -396,16 +486,16 @@ def main():
             return len(self.items)
 
         def __getitem__(self, idx: int):
-            rel, text = self.items[idx]
-            img = Image.open(self.root / rel).convert("L")
+            root, rel, text = self.items[idx]
+            img = Image.open(root / rel).convert("L")
             valid_w = estimate_valid_width_from_image_L(
                 img, ink_thresh=self.ink_thresh)
             arr = np.array(img, dtype=np.float32) / 255.0
             x = torch.from_numpy(arr).unsqueeze(0)
             return x, valid_w, text
 
-    train_ds = _Subset(cfg.data_dir, train_items, cfg.ink_thresh)
-    val_ds = _Subset(cfg.data_dir, val_items, cfg.ink_thresh)
+    train_ds = _Subset(train_items, cfg.ink_thresh)
+    val_ds = _Subset(val_items, cfg.ink_thresh)
 
     def collate(b): return collate_ctc(b, vocab)
 
@@ -496,7 +586,6 @@ def main():
     # TorchScript export
     model.load_state_dict(torch.load(ckpt, map_location="cpu"))
     model.eval()
-    example = torch.randn(1, 1, 32, 512)
     scripted = torch.jit.script(model)
     scripted.save(str(ts_path))
 
