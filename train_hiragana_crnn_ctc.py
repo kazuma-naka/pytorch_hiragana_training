@@ -584,8 +584,12 @@ def main():
                 f"[epoch {epoch}] best checkpoint saved -> {ckpt}", flush=True)
 
     # TorchScript export
-    model.load_state_dict(torch.load(ckpt, map_location="cpu"))
+    state = torch.load(ckpt, map_location="cpu")
+    model.load_state_dict(state)
+
+    model = model.to("cpu")          # ★これを必ず入れる
     model.eval()
+
     scripted = torch.jit.script(model)
     scripted.save(str(ts_path))
 

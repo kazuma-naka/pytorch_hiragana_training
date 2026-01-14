@@ -56,8 +56,8 @@ python collect_hiragana_tk.py --out_dir dataset_hira
 
 ---
 
-```
-python3 build_dataset_from_android_pictures.py --src_root exported/Pictures/MyHandwriteApp --out_dir dataset_hira --prefix label_ --target_h 32 --max_w 512 --ink_thresh 245 --pad 0 --blur 0.0
+```bash
+python3 build_dataset_from_android_pictures.py --src_root exported/Pictures/hand_writting_save_img --out_dir dataset_hira --prefix label_ --target_h 32 --max_w 512 --ink_thresh 245 --pad 0 --blur 0.0
 ```
 
 #### 2) 学習（CRNN + CTC）
@@ -82,6 +82,29 @@ python3 train_hiragana_crnn_ctc.py --data_dir dataset_tomoe_hira --labels datase
 ```bash
 
 python3 train_hiragana_crnn_ctc.py --dataset dataset_hira:dataset_hira/labels.jsonl --dataset dataset_tomoe_hira:dataset_tomoe_hira/labels.jsonl --out_dir runs/hira_ctc_multi --epochs 200 --batch_size 32 --lr 1e-3 --device cuda
+
+
+```
+
+```bash
+python3 collect_hiragana_tk.py --out_dir dataset_hira_font --auto_elastic_alpha 18 --auto_elastic_sigma 6 --auto_scale_min 0.8 --auto_scale_max 1 --auto_erode_prob 0 --auto_edge_blur 0 --auto_elastic_prob 0 --auto_pressure_prob 0 --auto_blur 0 --auto_interval_ms 1 --auto_repeat_per_token 200 --auto_thicken_min 1 --auto_thicken_max 2 --auto_noise 0 --auto_font_ttf_list "$(printf '%s ' fonts/*.ttf fonts/*.otf 2>/dev/null)"
+```
+
+```bash
+
+python3 train_hiragana_crnn_ctc.py --dataset dataset_hira:dataset_hira/labels.jsonl --dataset dataset_tomoe_hira:dataset_tomoe_hira/labels.jsonl --out_dir runs/hira_ctc_multi --epochs 200 --batch_size 32 --lr 1e-3 --device cuda
+
+python3 train_hiragana_crnn_ctc.py --dataset dataset_hira:dataset_hira/labels.jsonl --dataset dataset_tomoe_hira:dataset_tomoe_hira/labels.jsonl --dataset dataset_hira_font:dataset_hira_font/labels.jsonl --out_dir runs/hira_ctc_multi_fonts --epochs 200 --batch_size 32 --lr 1e-3 --device cuda
+
+ python3 train_hiragana_crnn_ctc.py --dataset dataset_hira:dataset_hira/labels.jsonl --dataset dataset_tomoe_hira:dataset_tomoe_hira/labels.jsonl --dataset dataset_etl4c_norm:dataset_etl4c_norm/labels.jsonl --out_dir runs/hira_ctc_multi_tomoe_etl4 --epochs 200 --batch_size 32 --lr 1e-3 --device cuda
+
+```
+
+```bash
+python3 preprocess_unpacked_jsonl.py --in_dir ETL4/ETL4C_unpack --out_dir dataset_etl4c_norm --white_bg yes --invert auto --autocontrast 1.0 --ink_thresh 250 --target_h 32 --max_w 512 --blur 0.6
+
+
+python3 preprocess_unpacked_jsonl.py --in_dir ETL4/ETL4C_unpack --out_dir dataset_etl4c_norm --white_bg yes --include_iwiwe
 
 
 ```
