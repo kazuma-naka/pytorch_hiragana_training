@@ -91,6 +91,31 @@ class CollectConfig:
     tomoe_point_jitter: float = 1.4     # px gaussian jitter
     tomoe_drop_point_prob: float = 0.03  # randomly drop points
 
+    # --- tomoe stroke shape perturbation (NEW) ---
+    # probability to perturb each stroke (0..1)
+    tomoe_stroke_perturb_prob: float = 0.0
+
+    # shorten (trim) probabilities (per stroke)
+    tomoe_trim_prob: float = 0.0
+    # max trim fraction of total arc length per side (0..0.49 recommended)
+    tomoe_trim_max_frac: float = 0.12
+
+    # extend probabilities (per stroke)
+    tomoe_extend_prob: float = 0.0
+    # max extend fraction of total arc length per side (0..0.5 recommended)
+    tomoe_extend_max_frac: float = 0.10
+
+    # curve probabilities (per stroke)
+    tomoe_curve_prob: float = 0.0
+    # max curve amplitude in px (base coordinate space; tomoe_base_size scale)
+    tomoe_curve_amp_px: float = 2.5
+    # curve frequency range (number of half-waves over stroke; 1..3 typical)
+    tomoe_curve_freq_min: float = 0.8
+    tomoe_curve_freq_max: float = 2.2
+
+    # resample points for perturbation
+    tomoe_perturb_resample_n: int = 48
+
 
 # ---------------- Utilities ----------------
 
@@ -513,6 +538,227 @@ def _jitter_and_drop_points(strokes: List[TomoeStroke], cfg: CollectConfig) -> L
     return new_strokes
 
 
+# ---- NEW: stroke shape perturbation helpers ----
+
+def _polyline_length_xy(x: np.ndarray, y: np.ndarray) -> float:
+    if x.size < 2:
+        return 0.0
+    dx = np.diff(x)
+    dy = np.diff(y)
+    return float(np.sum(np.sqrt(dx * dx + dy * dy)))
+
+
+def _polyline_cumlen(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    if x.size < 2:
+        return np.array([0.0], dtype=np.float32)
+    dx = np.diff(x)
+    dy = np.diff(y)
+    seg = np.sqrt(dx * dx + dy * dy).astype(np.float32)
+    out = np.concatenate([np.array([0.0], dtype=np.float32), np.cumsum(seg)])
+    return out
+
+
+def _resample_polyline_by_arclen(x: np.ndarray, y: np.ndarray, n: int) -> Tuple[np.ndarray, np.ndarray]:
+    n = int(max(2, n))
+    if x.size < 2:
+        return x.copy(), y.copy()
+
+    s = _polyline_cumlen(x, y)
+    L = float(s[-1])
+    if L <= 1e-6:
+        # degenerate
+        return x.copy(), y.copy()
+
+    ts = np.linspace(0.0, L, n, dtype=np.float32)
+    xr = np.interp(ts, s, x).astype(np.float32)
+    yr = np.interp(ts, s, y).astype(np.float32)
+    return xr, yr
+
+
+def _trim_polyline(x: np.ndarray, y: np.ndarray, trim_start: float, trim_end: float) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    trim_start/end are lengths in same units as x/y (px) along arc-length.
+    """
+    if x.size < 2:
+        return x, y
+
+    s = _polyline_cumlen(x, y)
+    L = float(s[-1])
+    if L <= 1e-6:
+        return x, y
+
+    a = float(np.clip(trim_start, 0.0, max(0.0, L - 1e-3)))
+    b = float(np.clip(L - trim_end, 1e-3, L))
+    if b <= a + 1e-3:
+        return x, y
+
+    # resample within [a, b]
+    n = max(2, x.size)
+    ts = np.linspace(a, b, n, dtype=np.float32)
+    xr = np.interp(ts, s, x).astype(np.float32)
+    yr = np.interp(ts, s, y).astype(np.float32)
+    return xr, yr
+
+
+def _extend_polyline_endpoints(x: np.ndarray, y: np.ndarray, extend_start: float, extend_end: float) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    extend_start/end in px. Extend along endpoint tangents.
+    """
+    if x.size < 2:
+        return x, y
+
+    # compute tangents
+    v0 = np.array([x[1] - x[0], y[1] - y[0]], dtype=np.float32)
+    v1 = np.array([x[-1] - x[-2], y[-1] - y[-2]], dtype=np.float32)
+
+    n0 = float(np.hypot(v0[0], v0[1]))
+    n1 = float(np.hypot(v1[0], v1[1]))
+    if n0 <= 1e-6 or n1 <= 1e-6:
+        return x, y
+
+    t0 = v0 / n0
+    t1 = v1 / n1
+
+    pts_x = x.copy()
+    pts_y = y.copy()
+
+    if extend_start > 0:
+        # prepend one point
+        xs = float(x[0] - t0[0] * extend_start)
+        ys = float(y[0] - t0[1] * extend_start)
+        pts_x = np.concatenate([np.array([xs], dtype=np.float32), pts_x])
+        pts_y = np.concatenate([np.array([ys], dtype=np.float32), pts_y])
+
+    if extend_end > 0:
+        xe = float(x[-1] + t1[0] * extend_end)
+        ye = float(y[-1] + t1[1] * extend_end)
+        pts_x = np.concatenate([pts_x, np.array([xe], dtype=np.float32)])
+        pts_y = np.concatenate([pts_y, np.array([ye], dtype=np.float32)])
+
+    return pts_x, pts_y
+
+
+def _apply_curve_offset(x: np.ndarray, y: np.ndarray, amp_px: float, freq: float) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Add a smooth sideways (normal direction) offset along the stroke.
+    amp_px: max amplitude in px
+    freq: how many half-waves across the stroke (roughly)
+    """
+    if x.size < 3:
+        return x, y
+    amp_px = float(max(0.0, amp_px))
+    if amp_px <= 1e-6:
+        return x, y
+
+    # parameter t in [0,1] using arc-length
+    s = _polyline_cumlen(x, y).astype(np.float32)
+    L = float(s[-1])
+    if L <= 1e-6:
+        return x, y
+    t = (s / L).astype(np.float32)
+
+    # estimate tangent using central differences
+    dx = np.gradient(x.astype(np.float32))
+    dy = np.gradient(y.astype(np.float32))
+    norm = np.sqrt(dx * dx + dy * dy) + 1e-6
+    tx = dx / norm
+    ty = dy / norm
+
+    # normal
+    nx = -ty
+    ny = tx
+
+    # smooth offset profile (sin with random phase)
+    phase = random.uniform(0.0, 2.0 * np.pi)
+    sign = -1.0 if random.random() < 0.5 else 1.0
+    # Use sin(pi * freq * t) so ends tend to be near 0
+    profile = np.sin(np.pi * float(freq) * t + phase).astype(np.float32)
+    # taper ends to reduce artifacts
+    taper = (np.sin(np.pi * t)).astype(np.float32)  # 0 at ends, 1 mid
+    off = (sign * float(amp_px)) * profile * taper
+
+    xr = x.astype(np.float32) + nx * off
+    yr = y.astype(np.float32) + ny * off
+    return xr, yr
+
+
+def _tomoe_perturb_strokes(strokes: List[TomoeStroke], cfg: CollectConfig) -> List[TomoeStroke]:
+    """
+    Randomly perturb each stroke:
+      - trim: shorten ends
+      - extend: lengthen ends
+      - curve: add smooth curvature
+    This runs after jitter/drop, before drawing.
+    """
+    p_all = float(getattr(cfg, "tomoe_stroke_perturb_prob", 0.0))
+    p_trim = float(getattr(cfg, "tomoe_trim_prob", 0.0))
+    p_ext = float(getattr(cfg, "tomoe_extend_prob", 0.0))
+    p_curve = float(getattr(cfg, "tomoe_curve_prob", 0.0))
+
+    trim_max_frac = float(getattr(cfg, "tomoe_trim_max_frac", 0.12))
+    ext_max_frac = float(getattr(cfg, "tomoe_extend_max_frac", 0.10))
+
+    amp_px = float(getattr(cfg, "tomoe_curve_amp_px", 2.5))
+    fmin = float(getattr(cfg, "tomoe_curve_freq_min", 0.8))
+    fmax = float(getattr(cfg, "tomoe_curve_freq_max", 2.2))
+
+    resample_n = int(getattr(cfg, "tomoe_perturb_resample_n", 48))
+
+    out: List[TomoeStroke] = []
+    for st in strokes:
+        if len(st) < 2:
+            out.append(st)
+            continue
+
+        if p_all <= 0.0 or random.random() >= p_all:
+            out.append(st)
+            continue
+
+        x = np.array([p[0] for p in st], dtype=np.float32)
+        y = np.array([p[1] for p in st], dtype=np.float32)
+
+        # Resample to stable spacing (helps curvature/trim behave better)
+        x, y = _resample_polyline_by_arclen(x, y, n=resample_n)
+
+        L = _polyline_length_xy(x, y)
+        if L <= 2.0:
+            out.append([(float(xx), float(yy)) for (xx, yy) in zip(x, y)])
+            continue
+
+        # Trim (shorten)
+        if p_trim > 0 and random.random() < p_trim:
+            # trim both ends independently but keep enough length
+            mx = max(0.0, min(0.49, trim_max_frac))
+            t0 = random.uniform(0.0, mx) * L
+            t1 = random.uniform(0.0, mx) * L
+            x, y = _trim_polyline(x, y, trim_start=t0, trim_end=t1)
+
+        # Extend (lengthen)
+        if p_ext > 0 and random.random() < p_ext:
+            mx = max(0.0, min(0.50, ext_max_frac))
+            e0 = random.uniform(0.0, mx) * L
+            e1 = random.uniform(0.0, mx) * L
+            x, y = _extend_polyline_endpoints(
+                x, y, extend_start=e0, extend_end=e1)
+            # resample again to smooth joins
+            x, y = _resample_polyline_by_arclen(x, y, n=resample_n)
+
+        # Curve
+        if p_curve > 0 and random.random() < p_curve:
+            freq = random.uniform(min(fmin, fmax), max(fmin, fmax))
+            amp = random.uniform(0.35, 1.00) * amp_px
+            x, y = _apply_curve_offset(x, y, amp_px=amp, freq=freq)
+
+        # Optional: clamp coordinates to base canvas bounds (0..base_size)
+        base_size = float(getattr(cfg, "tomoe_base_size", 320))
+        x = np.clip(x, 0.0, base_size)
+        y = np.clip(y, 0.0, base_size)
+
+        out.append([(float(xx), float(yy)) for (xx, yy) in zip(x, y)])
+
+    return out
+
+
 def render_tomoe_strokes_to_canvas_image(strokes: List[TomoeStroke], cfg: CollectConfig) -> Image.Image:
     """
     Render tomoe strokes to a 320x320 base, apply handwriting-like effects,
@@ -525,6 +771,9 @@ def render_tomoe_strokes_to_canvas_image(strokes: List[TomoeStroke], cfg: Collec
 
     # jitter/drop points to simulate handwriting variance
     strokes2 = _jitter_and_drop_points(strokes, cfg)
+
+    # NEW: optional stroke shape perturbation (shorten/extend/curve)
+    strokes2 = _tomoe_perturb_strokes(strokes2, cfg)
 
     wmin = int(getattr(cfg, "tomoe_pen_width_min",
                max(1, cfg.stroke_width - 4)))
@@ -1260,6 +1509,7 @@ class CollectorApp:
         ]
         if self.auto_source_var.get().strip().lower() == "tomoe":
             parts.append(f"tdic_loaded={len(self._tomoe_dict)}")
+            parts.append(f"perturb_prob={self.cfg.tomoe_stroke_perturb_prob}")
         self.auto_count_var.set("  ".join(parts))
 
     def start_auto(self):
@@ -1547,6 +1797,28 @@ def main():
     ap.add_argument("--tomoe_tdic_gui", type=str, default="",
                     help="Default .tdic path in GUI (optional)")
 
+    # NEW: tomoe stroke perturbation controls
+    ap.add_argument("--tomoe_stroke_perturb_prob", type=float, default=0.0,
+                    help="Probability to perturb each stroke (0..1). Enables trim/extend/curve when >0.")
+    ap.add_argument("--tomoe_trim_prob", type=float, default=0.0,
+                    help="Probability per perturbed stroke to trim ends (0..1).")
+    ap.add_argument("--tomoe_trim_max_frac", type=float, default=0.12,
+                    help="Max trim fraction per side (0..0.49).")
+    ap.add_argument("--tomoe_extend_prob", type=float, default=0.0,
+                    help="Probability per perturbed stroke to extend ends (0..1).")
+    ap.add_argument("--tomoe_extend_max_frac", type=float, default=0.10,
+                    help="Max extend fraction per side (0..0.5).")
+    ap.add_argument("--tomoe_curve_prob", type=float, default=0.0,
+                    help="Probability per perturbed stroke to add curvature (0..1).")
+    ap.add_argument("--tomoe_curve_amp_px", type=float, default=2.5,
+                    help="Max curve amplitude in px (base space).")
+    ap.add_argument("--tomoe_curve_freq_min", type=float, default=0.8,
+                    help="Min curve frequency.")
+    ap.add_argument("--tomoe_curve_freq_max", type=float, default=2.2,
+                    help="Max curve frequency.")
+    ap.add_argument("--tomoe_perturb_resample_n", type=int, default=48,
+                    help="Resample points count for stroke perturbation (>=2).")
+
     args = ap.parse_args()
 
     th_min = int(args.auto_thicken_min)
@@ -1612,6 +1884,18 @@ def main():
         tomoe_pen_width_max=int(args.tomoe_pen_width_max),
         tomoe_point_jitter=float(args.tomoe_point_jitter),
         tomoe_drop_point_prob=float(args.tomoe_drop_point_prob),
+
+        # NEW
+        tomoe_stroke_perturb_prob=float(args.tomoe_stroke_perturb_prob),
+        tomoe_trim_prob=float(args.tomoe_trim_prob),
+        tomoe_trim_max_frac=float(args.tomoe_trim_max_frac),
+        tomoe_extend_prob=float(args.tomoe_extend_prob),
+        tomoe_extend_max_frac=float(args.tomoe_extend_max_frac),
+        tomoe_curve_prob=float(args.tomoe_curve_prob),
+        tomoe_curve_amp_px=float(args.tomoe_curve_amp_px),
+        tomoe_curve_freq_min=float(args.tomoe_curve_freq_min),
+        tomoe_curve_freq_max=float(args.tomoe_curve_freq_max),
+        tomoe_perturb_resample_n=int(args.tomoe_perturb_resample_n),
     )
 
     if args.batch:
