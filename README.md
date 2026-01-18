@@ -258,6 +258,14 @@ Outputs:
 python3 train_hiragana_crnn_ctc.py   --data_dir dataset_hira   --labels dataset_hira/labels.jsonl   --out_dir runs/hira_ctc_from_dataset_hira   --epochs 200 --batch_size 32 --lr 1e-3 --device cpu
 ```
 
+```bash
+
+python3 collect_hiragana_tk.py --batch --tomoe --tomoe_tdic tomoe_data/all.tdic --tomoe_categories hiragana,digits,kanji --tomoe_per_char 200 --out_dir dataset_tomoe_all_hira_digits_kanji --target_h 32 --max_w 512 --tomoe_pen_width_min 12 --tomoe_pen_width_max 14 --auto_scale_min 1 --auto_scale_max 1.2 --tomoe_point_jitter 0.6 --tomoe_drop_point_prob 0 --auto_pressure_prob 0 --auto_elastic_prob 0.1 --auto_elastic_alpha 6 --auto_elastic_sigma 3 --auto_erode_prob 0.3 --auto_edge_blur 0.2 --auto_blur 0.3 --auto_rotate_deg 6 --auto_noise 0.2 --tomoe_stroke_perturb_prob 0.8 --tomoe_trim_prob 0.35 --tomoe_trim_max_frac 0.18 --tomoe_extend_prob 0.25 --tomoe_extend_max_frac 0.12 --tomoe_curve_prob 0.50 --tomoe_curve_amp_px 2.2 --tomoe_curve_freq_min 0.8 --tomoe_curve_freq_max 2.0 --tomoe_perturb_resample_n 56
+
+python3 train_hiragana_crnn_ctc.py --dataset dataset_hira:dataset_hira/labels.jsonl --dataset dataset_tomoe_hira:dataset_tomoe_hira/labels.jsonl --out_dir runs/hira_ctc_multi --epochs 300 --batch_size 32 --lr 1e-3 --device cuda --lr_scheduler plateau --plateau_patience 2 --plateau_factor 0.5 --min_lr 1e-6
+
+```
+
 Artifacts in `--out_dir`:
 
 - `model_state_dict.pt` (best checkpoint)
