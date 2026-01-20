@@ -9,8 +9,13 @@
 # 2) Optional: min width padding at training time to avoid extremely tiny widths
 #    - --min_w (default 96). Set 0 to disable.
 #
-# Usage example:
-# python3 train_hiragana_crnn_ctc.py --dataset dataset_hira:dataset_hira/labels.jsonl --dataset dataset_tomoe_hira:dataset_tomoe_hira/labels.jsonl --out_dir runs/hira_ctc_multi --epochs 256 --batch_size 64 --lr 5e-4 --device cuda --min_w 96
+# Added (training correctness diagnostics):
+# - Shape/time-step logs (xb/log_probs/T/input_lens/target_lens)
+# - CTC validity checks: input_lens < target_lens count, clamp input_lens to T
+# - NaN/Inf detection for loss/log_probs
+# - Grad-norm logging
+# - Validation metrics: exact match rate + CER (greedy decode)
+# - Prediction previews from validation set
 
 from __future__ import annotations
 
@@ -288,6 +293,61 @@ def width_to_time_steps(valid_widths: torch.Tensor) -> torch.Tensor:
     return torch.clamp(valid_widths // 2, min=1)
 
 
+# ---------------- Diagnostics ----------------
+
+def _is_finite_tensor(t: torch.Tensor) -> bool:
+    return bool(torch.isfinite(t).all().item())
+
+
+def _grad_norm(model: nn.Module, norm_type: float = 2.0) -> float:
+    # Similar to torch.nn.utils.clip_grad_norm_ but without clipping
+    parameters = [p for p in model.parameters() if p.grad is not None]
+    if not parameters:
+        return 0.0
+    device = parameters[0].grad.device
+    total = torch.zeros((), device=device)
+    for p in parameters:
+        param_norm = p.grad.data.norm(norm_type)
+        total = total + (param_norm ** norm_type)
+    return float(total.pow(1.0 / norm_type).item())
+
+
+def _levenshtein(a: str, b: str) -> int:
+    # small strings, DP ok
+    if a == b:
+        return 0
+    if len(a) == 0:
+        return len(b)
+    if len(b) == 0:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        cur = [i]
+        for j, cb in enumerate(b, start=1):
+            ins = cur[j - 1] + 1
+            dele = prev[j] + 1
+            sub = prev[j - 1] + (0 if ca == cb else 1)
+            cur.append(min(ins, dele, sub))
+        prev = cur
+    return prev[-1]
+
+
+def _ctc_greedy_decode_batch(log_probs: torch.Tensor, input_lens: torch.Tensor, vocab: Vocab) -> List[str]:
+    # log_probs: [T,B,V]
+    # input_lens: [B] (<=T)
+    # returns decoded strings length B
+    with torch.no_grad():
+        pred_ids = torch.argmax(log_probs, dim=-1)  # [T,B]
+        T, B = pred_ids.shape
+        out = []
+        for b in range(B):
+            tlen = int(input_lens[b].item())
+            tlen = max(1, min(tlen, T))
+            ids = pred_ids[:tlen, b].tolist()
+            out.append(vocab.decode_greedy_ctc(ids))
+        return out
+
+
 # ---------------- Progress helpers ----------------
 
 def _fmt_time(sec: float) -> str:
@@ -390,6 +450,13 @@ class TrainConfig:
     log_every: int = 50
     progress_seconds: float = 2.0
 
+    # diagnostics
+    diag_every: int = 200          # detailed diag log every N train steps
+    preview_every: int = 1         # show val previews every N epochs
+    preview_samples: int = 8       # number of preview samples
+    strict_nan: bool = False       # if True, abort on NaN/Inf
+    max_bad_ctc_ratio: float = 0.30  # warn if input_lens < target_lens exceeds this ratio
+
 
 def parse_dataset_spec(s: str) -> Tuple[Path, Path]:
     """
@@ -418,6 +485,16 @@ def parse_dataset_spec(s: str) -> Tuple[Path, Path]:
     return root, labels2
 
 
+def _print_once_header(cfg: TrainConfig, vocab: Vocab, train_n: int, val_n: int) -> None:
+    print("========== CONFIG ==========")
+    print(f"device={cfg.device} seed={cfg.seed} epochs={cfg.epochs} batch_size={cfg.batch_size} lr={cfg.lr}")
+    print(f"vocab_size={vocab.size} (blank=0, chars={len(vocab.itos)}) include_punct={cfg.include_punct} include_space={cfg.include_space}")
+    print(f"datasets={len(cfg.datasets)} train_samples={train_n} val_samples={val_n} val_ratio={cfg.val_ratio}")
+    print(f"ink_thresh={cfg.ink_thresh} min_w={cfg.min_w} num_workers={cfg.num_workers}")
+    print(f"diag_every={cfg.diag_every} preview_every={cfg.preview_every} preview_samples={cfg.preview_samples} strict_nan={cfg.strict_nan}")
+    print("============================", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
 
@@ -437,8 +514,7 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--num_workers", type=int, default=2)
-    ap.add_argument("--device", type=str, default="cpu",
-                    choices=["cpu", "cuda"])
+    ap.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"])
     ap.add_argument("--val_ratio", type=float, default=0.1)
 
     ap.add_argument("--no_punct", action="store_true")
@@ -459,6 +535,18 @@ def main():
                     help="Print progress every N training steps (in addition to time-based printing).")
     ap.add_argument("--progress_seconds", type=float, default=2.0,
                     help="Print progress at least every N seconds.")
+
+    # diagnostics args
+    ap.add_argument("--diag_every", type=int, default=200,
+                    help="Print detailed diagnostics every N training steps.")
+    ap.add_argument("--preview_every", type=int, default=1,
+                    help="Print validation prediction previews every N epochs.")
+    ap.add_argument("--preview_samples", type=int, default=8,
+                    help="Number of samples to preview from validation set.")
+    ap.add_argument("--strict_nan", action="store_true",
+                    help="Abort training if NaN/Inf is detected in loss/log_probs.")
+    ap.add_argument("--max_bad_ctc_ratio", type=float, default=0.30,
+                    help="Warn if fraction of samples with input_lens < target_lens exceeds this threshold.")
 
     args = ap.parse_args()
 
@@ -491,6 +579,11 @@ def main():
         min_w=int(args.min_w),
         log_every=int(args.log_every),
         progress_seconds=float(args.progress_seconds),
+        diag_every=int(args.diag_every),
+        preview_every=int(args.preview_every),
+        preview_samples=int(args.preview_samples),
+        strict_nan=bool(args.strict_nan),
+        max_bad_ctc_ratio=float(args.max_bad_ctc_ratio),
     )
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -549,6 +642,8 @@ def main():
         num_workers=cfg.num_workers, collate_fn=collate, drop_last=False
     )
 
+    _print_once_header(cfg, vocab, train_n=len(train_ds), val_n=len(val_ds))
+
     model = CRNNCTC(vocab_size=vocab.size, rnn_hidden=cfg.rnn_hidden,
                     rnn_layers=cfg.rnn_layers).to(cfg.device)
     opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
@@ -561,6 +656,11 @@ def main():
     pcfg = ProgressConfig(log_every=cfg.log_every,
                           progress_seconds=cfg.progress_seconds)
 
+    # For stable preview selection across epochs
+    preview_indices = list(range(min(len(val_ds), max(1, cfg.preview_samples))))
+
+    global_step = 0
+
     for epoch in range(1, cfg.epochs + 1):
         # ---- Train ----
         model.train()
@@ -568,17 +668,42 @@ def main():
                            total_samples=len(train_ds), pcfg=pcfg)
 
         for xb, valid_widths, targets, target_lens in train_loader:
+            global_step += 1
             xb = xb.to(cfg.device)
             targets = targets.to(cfg.device)
             target_lens = target_lens.to(cfg.device)
 
             log_probs = model(xb)  # [T,B,V]
+            T = int(log_probs.shape[0])
+
+            # compute input lengths from valid widths (on CPU tensor) then clamp to T
             input_lens = width_to_time_steps(valid_widths).to(cfg.device)  # [B]
+            # clamp input_lens to T to satisfy CTCLoss requirement input_lens <= T
+            if (input_lens > T).any().item():
+                bad = int((input_lens > T).sum().item())
+                print(f"[epoch {epoch}] WARN: {bad} samples had input_lens > T (T={T}); clamping to T.", flush=True)
+                input_lens = torch.clamp(input_lens, max=T)
+
+            # diagnose input_lens vs target_lens
+            bad_ctc = (input_lens < target_lens).sum().item()
+            bad_ctc_ratio = float(bad_ctc) / max(1.0, float(xb.shape[0]))
 
             loss = ctc_loss(log_probs, targets, input_lens, target_lens)
 
+            # NaN/Inf checks
+            if not torch.isfinite(loss).item():
+                print(f"[epoch {epoch}] ERROR: loss is not finite: {float(loss.item())}", flush=True)
+                if cfg.strict_nan:
+                    raise RuntimeError("Non-finite loss detected.")
+            if (global_step % cfg.diag_every == 0) and (not _is_finite_tensor(log_probs)):
+                print(f"[epoch {epoch}] ERROR: log_probs contains NaN/Inf.", flush=True)
+                if cfg.strict_nan:
+                    raise RuntimeError("Non-finite log_probs detected.")
+
             opt.zero_grad()
             loss.backward()
+
+            gnorm = _grad_norm(model)
             opt.step()
 
             tr.update(batch_size=int(xb.shape[0]),
@@ -588,36 +713,114 @@ def main():
                 print(tr.render(prefix=f"[epoch {epoch}] train:"), flush=True)
                 tr.mark_printed()
 
+            # Detailed diagnostics (shape/length sanity)
+            if global_step % cfg.diag_every == 0:
+                vw = valid_widths.detach().cpu()
+                il = input_lens.detach().cpu()
+                tl = target_lens.detach().cpu()
+
+                msg = []
+                msg.append(f"[epoch {epoch}] DIAG step={global_step}")
+                msg.append(f"  xb.shape={tuple(xb.shape)}  log_probs.shape={tuple(log_probs.shape)}  T={T}")
+                msg.append(f"  valid_widths: min={int(vw.min())} mean={float(vw.float().mean()):.1f} max={int(vw.max())}")
+                msg.append(f"  input_lens:   min={int(il.min())} mean={float(il.float().mean()):.1f} max={int(il.max())} (clamped<=T)")
+                msg.append(f"  target_lens:  min={int(tl.min())} mean={float(tl.float().mean()):.2f} max={int(tl.max())}")
+                msg.append(f"  bad_ctc(input_lens<target_lens)={int(bad_ctc)}/{int(xb.shape[0])} ({bad_ctc_ratio*100:.1f}%)")
+                msg.append(f"  loss={float(loss.item()):.6f} grad_norm={gnorm:.3f} lr={opt.param_groups[0]['lr']:.6g}")
+                if bad_ctc_ratio >= cfg.max_bad_ctc_ratio:
+                    msg.append("  WARN: bad_ctc_ratio is high. Consider increasing min_w, reducing downsample, or filtering tiny samples.")
+                if not torch.isfinite(loss).item():
+                    msg.append("  WARN: loss is non-finite.")
+                print("\n".join(msg), flush=True)
+
         train_loss = tr.loss_sum / max(1, tr.step)
 
         # ---- Val ----
         model.eval()
         va = EpochProgress(total_steps=len(val_loader),
                            total_samples=len(val_ds), pcfg=pcfg)
+
+        total_edit = 0
+        total_chars = 0
+        total_exact = 0
+        total_samples = 0
+
+        preview_pairs: List[Tuple[str, str]] = []
+
         with torch.no_grad():
-            for xb, valid_widths, targets, target_lens in val_loader:
+            for bidx, (xb, valid_widths, targets, target_lens) in enumerate(val_loader):
                 xb = xb.to(cfg.device)
                 targets = targets.to(cfg.device)
                 target_lens = target_lens.to(cfg.device)
 
                 log_probs = model(xb)
-                input_lens = width_to_time_steps(valid_widths).to(cfg.device)
-                loss = ctc_loss(log_probs, targets, input_lens, target_lens)
+                T = int(log_probs.shape[0])
 
+                input_lens = width_to_time_steps(valid_widths).to(cfg.device)
+                if (input_lens > T).any().item():
+                    input_lens = torch.clamp(input_lens, max=T)
+
+                loss = ctc_loss(log_probs, targets, input_lens, target_lens)
                 va.update(batch_size=int(xb.shape[0]), loss_value=float(loss.item()))
 
                 if va.should_print():
                     print(va.render(prefix=f"[epoch {epoch}]  val:"), flush=True)
                     va.mark_printed()
 
-        val_loss = va.loss_sum / max(1, va.step)
+                # metrics: greedy decode -> CER + exact match
+                preds = _ctc_greedy_decode_batch(log_probs, input_lens, vocab)
 
-        print(f"[epoch {epoch}] summary: train_loss={train_loss:.4f} val_loss={val_loss:.4f}", flush=True)
+                # rebuild target strings from flat targets/target_lens
+                # targets is 1D concatenated. Need to slice per sample.
+                tlist = targets.detach().cpu().tolist()
+                lens = target_lens.detach().cpu().tolist()
+                off = 0
+                for i, L in enumerate(lens):
+                    ids = tlist[off:off + L]
+                    off += L
+                    # ids are vocab indices (1..), 0 blank never appears in targets
+                    tgt = "".join([vocab.itos[j - 1] for j in ids])
+                    pred = preds[i]
+
+                    d = _levenshtein(tgt, pred)
+                    total_edit += d
+                    total_chars += max(1, len(tgt))
+                    total_exact += (1 if tgt == pred else 0)
+                    total_samples += 1
+
+                # collect previews from the first few batches
+                if (epoch % cfg.preview_every == 0) and (len(preview_pairs) < cfg.preview_samples):
+                    # take as many as needed from this batch
+                    tlist2 = targets.detach().cpu().tolist()
+                    lens2 = target_lens.detach().cpu().tolist()
+                    off2 = 0
+                    for i, L in enumerate(lens2):
+                        if len(preview_pairs) >= cfg.preview_samples:
+                            break
+                        ids = tlist2[off2:off2 + L]
+                        off2 += L
+                        tgt = "".join([vocab.itos[j - 1] for j in ids])
+                        preview_pairs.append((tgt, preds[i]))
+
+        val_loss = va.loss_sum / max(1, va.step)
+        cer = float(total_edit) / max(1.0, float(total_chars))
+        acc = float(total_exact) / max(1.0, float(total_samples))
+
+        print(
+            f"[epoch {epoch}] summary: train_loss={train_loss:.4f} val_loss={val_loss:.4f} val_CER={cer:.4f} val_exact={acc:.4f}",
+            flush=True
+        )
+
+        if (epoch % cfg.preview_every == 0) and preview_pairs:
+            print(f"[epoch {epoch}] preview (val, greedy decode):", flush=True)
+            for i, (tgt, pred) in enumerate(preview_pairs[:cfg.preview_samples], start=1):
+                ok = ("OK" if tgt == pred else "NG")
+                print(f"  {i:02d} {ok}  tgt='{tgt}'  pred='{pred}'", flush=True)
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save(model.state_dict(), ckpt)
-            print(f"[epoch {epoch}] best checkpoint saved -> {ckpt}", flush=True)
+            print(f"[epoch {epoch}] best checkpoint saved -> {ckpt} (best_val_loss={best_val_loss:.6f})", flush=True)
 
     # TorchScript export
     state = torch.load(ckpt, map_location="cpu")

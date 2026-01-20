@@ -267,6 +267,9 @@ python3 train_hiragana_crnn_ctc.py --dataset dataset_hira:dataset_hira/labels.js
 
 python3 train_hiragana_crnn_ctc.py --dataset dataset_hira:dataset_hira/labels.jsonl --dataset dataset_tomoe_hira:dataset_tomoe_hira/labels.jsonl --out_dir runs/hira_ctc_multi --epochs 256 --batch_size 64 --lr 3e-4 --device cuda --min_w 96
 
+
+python3 train_hiragana_crnn_ctc.py --dataset dataset_hira:dataset_hira/labels.jsonl --out_dir runs/hira_ctc_multi --epochs 256 --batch_size 64 --lr 5e-4 --device cuda --min_w 96 --diag_every 100 --log_every 20 --preview_every 1 --preview_samples 12
+
 ```
 
 Artifacts in `--out_dir`:
