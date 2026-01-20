@@ -5,11 +5,8 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
-import logging
 import random
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,10 +23,7 @@ from torch.utils.data import Dataset, DataLoader
 
 # ---------------- Vocabulary ----------------
 
-
-def hiragana_charset(
-    include_punct: bool = True, include_space: bool = True
-) -> List[str]:
+def hiragana_charset(include_punct: bool = True, include_space: bool = True) -> List[str]:
     chars = []
     for cp in range(0x3041, 0x3097):  # ぁ..ゖ
         chars.append(chr(cp))
@@ -47,8 +41,8 @@ def hiragana_charset(
 
 @dataclass
 class Vocab:
-    itos: List[str]  # index -> char (1..)
-    stoi: Dict[str, int]  # char -> index
+    itos: List[str]          # index -> char (1..)
+    stoi: Dict[str, int]     # char -> index
 
     @property
     def blank(self) -> int:
@@ -81,13 +75,13 @@ class Vocab:
 
 
 def build_vocab(include_punct: bool = True, include_space: bool = True) -> Vocab:
-    chars = hiragana_charset(include_punct=include_punct, include_space=include_space)
+    chars = hiragana_charset(include_punct=include_punct,
+                             include_space=include_space)
     stoi = {c: i + 1 for i, c in enumerate(chars)}  # 1.., 0 is blank
     return Vocab(itos=chars, stoi=stoi)
 
 
 # ---------------- Dataset ----------------
-
 
 def estimate_valid_width_from_image_L(img_L: Image.Image, ink_thresh: int = 245) -> int:
     """
@@ -159,7 +153,8 @@ class MultiJsonlHandwritingDataset(Dataset):
                     self.items.append((root, rel, text))
 
         if not self.items:
-            raise RuntimeError("No samples found across all provided datasets.")
+            raise RuntimeError(
+                "No samples found across all provided datasets.")
 
     def __len__(self) -> int:
         return len(self.items)
@@ -169,7 +164,8 @@ class MultiJsonlHandwritingDataset(Dataset):
         img_path = root / rel
         img = Image.open(img_path).convert("L")  # white bg, black ink
 
-        valid_w = estimate_valid_width_from_image_L(img, ink_thresh=self.ink_thresh)
+        valid_w = estimate_valid_width_from_image_L(
+            img, ink_thresh=self.ink_thresh)
 
         arr = np.array(img, dtype=np.float32) / 255.0
         x = torch.from_numpy(arr).unsqueeze(0)  # [1,H,W]
@@ -216,22 +212,17 @@ def collate_ctc(batch, vocab: Vocab):
 
 # ---------------- Model (CRNN) ----------------
 
-
 class ConvFeature(nn.Module):
     def __init__(self):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(1, 32, 3, padding=1),
-            nn.ReLU(),
+            nn.Conv2d(1, 32, 3, padding=1), nn.ReLU(),
             nn.MaxPool2d((2, 2)),  # H:32->16, W:/2
-            nn.Conv2d(32, 64, 3, padding=1),
-            nn.ReLU(),
+            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
             nn.MaxPool2d((2, 2)),  # H:16->8, W:/2 (=> W//4)
-            nn.Conv2d(64, 128, 3, padding=1),
-            nn.ReLU(),
+            nn.Conv2d(64, 128, 3, padding=1), nn.ReLU(),
             nn.MaxPool2d((2, 1)),  # H:8->4, W keep
-            nn.Conv2d(128, 128, 3, padding=1),
-            nn.ReLU(),
+            nn.Conv2d(128, 128, 3, padding=1), nn.ReLU(),
             nn.MaxPool2d((4, 1)),  # H:4->1, W keep
         )
 
@@ -253,11 +244,11 @@ class CRNNCTC(nn.Module):
         self.fc = nn.Linear(rnn_hidden * 2, vocab_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        f = self.feat(x)  # [B,128,1,W']
-        f = f.squeeze(2)  # [B,128,W']
-        f = f.permute(2, 0, 1)  # [T,B,128]
-        y, _ = self.rnn(f)  # [T,B,2H]
-        logits = self.fc(y)  # [T,B,V]
+        f = self.feat(x)              # [B,128,1,W']
+        f = f.squeeze(2)              # [B,128,W']
+        f = f.permute(2, 0, 1)        # [T,B,128]
+        y, _ = self.rnn(f)            # [T,B,2H]
+        logits = self.fc(y)           # [T,B,V]
         return F.log_softmax(logits, dim=-1)
 
 
@@ -267,7 +258,6 @@ def width_to_time_steps(valid_widths: torch.Tensor) -> torch.Tensor:
 
 
 # ---------------- Progress helpers ----------------
-
 
 def _fmt_time(sec: float) -> str:
     sec = max(0.0, float(sec))
@@ -338,129 +328,7 @@ class EpochProgress:
         self.last_print_t = time.time()
 
 
-# ---------------- Metrics (CER) ----------------
-
-
-def levenshtein(a: str, b: str) -> int:
-    # classic DP edit distance
-    if a == b:
-        return 0
-    if len(a) == 0:
-        return len(b)
-    if len(b) == 0:
-        return len(a)
-
-    # ensure b is shorter for memory efficiency
-    if len(b) > len(a):
-        a, b = b, a
-
-    prev = list(range(len(b) + 1))
-    for i, ca in enumerate(a, start=1):
-        cur = [i]
-        for j, cb in enumerate(b, start=1):
-            ins = cur[j - 1] + 1
-            dele = prev[j] + 1
-            sub = prev[j - 1] + (0 if ca == cb else 1)
-            cur.append(min(ins, dele, sub))
-        prev = cur
-    return prev[-1]
-
-
-def cer(pred: str, gt: str) -> float:
-    # character error rate
-    if len(gt) == 0:
-        return 0.0 if len(pred) == 0 else 1.0
-    return levenshtein(pred, gt) / float(len(gt))
-
-
-def greedy_decode_batch_ctc(
-    log_probs: torch.Tensor, input_lens: torch.Tensor, vocab: Vocab  # [T,B,V]  # [B]
-) -> List[str]:
-    # argmax over vocab for each timestep
-    # ids: [T,B]
-    ids = torch.argmax(log_probs, dim=-1).detach().cpu().numpy()
-    lens = input_lens.detach().cpu().numpy().astype(np.int64)
-
-    out: List[str] = []
-    T, B = ids.shape
-    for b in range(B):
-        tlen = int(lens[b])
-        tlen = max(1, min(int(tlen), int(T)))
-        seq = ids[:tlen, b].tolist()
-        out.append(vocab.decode_greedy_ctc(seq))
-    return out
-
-
-# ---------------- Logging ----------------
-
-
-def setup_logger(out_dir: Path, log_file: Optional[str] = None) -> logging.Logger:
-    """
-    Logger:
-    - Always logs to stdout.
-    - Logs to file ONLY if log_file is not None / not empty.
-    """
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    logger = logging.getLogger("hira_ctc_train")
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
-    logger.propagate = False
-
-    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
-
-    sh = logging.StreamHandler(stream=sys.stdout)
-    sh.setLevel(logging.INFO)
-    sh.setFormatter(fmt)
-    logger.addHandler(sh)
-
-    if log_file:
-        log_path = out_dir / log_file
-        fh = logging.FileHandler(str(log_path), mode="w", encoding="utf-8")
-        fh.setLevel(logging.INFO)
-        fh.setFormatter(fmt)
-        logger.addHandler(fh)
-
-    return logger
-
-
-class MetricsWriter:
-    """
-    Metrics files are created ONLY when this class is instantiated.
-    (So: do NOT instantiate unless user explicitly requested metrics output.)
-    """
-
-    def __init__(self, out_dir: Path):
-        self.jsonl_path = out_dir / "metrics.jsonl"
-        self.csv_path = out_dir / "metrics.csv"
-        self._csv_file = self.csv_path.open("w", newline="", encoding="utf-8")
-        self._csv_writer = None
-
-        # create/clear jsonl
-        self.jsonl_path.write_text("", encoding="utf-8")
-
-    def write(self, row: Dict) -> None:
-        # jsonl
-        with self.jsonl_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-
-        # csv
-        if self._csv_writer is None:
-            fieldnames = list(row.keys())
-            self._csv_writer = csv.DictWriter(self._csv_file, fieldnames=fieldnames)
-            self._csv_writer.writeheader()
-        self._csv_writer.writerow(row)
-        self._csv_file.flush()
-
-    def close(self) -> None:
-        try:
-            self._csv_file.close()
-        except Exception:
-            pass
-
-
 # ---------------- Train ----------------
-
 
 @dataclass
 class TrainConfig:
@@ -490,25 +358,6 @@ class TrainConfig:
     log_every: int = 50
     progress_seconds: float = 2.0
 
-    # evaluation
-    eval_samples: int = (
-        256  # number of val samples used to estimate CER (speed vs accuracy)
-    )
-
-    # lr scheduler
-    lr_scheduler: str = "none"  # none | plateau
-    plateau_mode: str = "min"  # min|max
-    plateau_factor: float = 0.5
-    plateau_patience: int = 2
-    plateau_threshold: float = 1e-4
-    plateau_threshold_mode: str = "rel"  # rel|abs
-    plateau_cooldown: int = 0
-    min_lr: float = 1e-6
-
-    # output controls (NEW)
-    log_file: Optional[str] = None  # e.g. "train.log" (default: None -> no file)
-    write_metrics: bool = False  # default: no metrics.jsonl/csv
-
 
 def parse_dataset_spec(s: str) -> Tuple[Path, Path]:
     """
@@ -537,53 +386,18 @@ def parse_dataset_spec(s: str) -> Tuple[Path, Path]:
     return root, labels2
 
 
-def _get_current_lr(optimizer: torch.optim.Optimizer) -> float:
-    lrs = []
-    for pg in optimizer.param_groups:
-        if "lr" in pg:
-            lrs.append(float(pg["lr"]))
-    if not lrs:
-        return float("nan")
-    # In most cases, all param groups share same lr. If not, we log the first.
-    return float(lrs[0])
-
-
-def _normalize_optional_str(s: Optional[str]) -> Optional[str]:
-    if s is None:
-        return None
-    t = str(s).strip()
-    if t == "":
-        return None
-    if t.lower() in ("none", "null", "no", "false", "0"):
-        return None
-    return t
-
-
 def main():
     ap = argparse.ArgumentParser()
 
     # Backward compatible single-dataset args (still usable)
-    ap.add_argument(
-        "--data_dir",
-        type=str,
-        default="dataset_hira",
-        help="(legacy) Single dataset root dir. If --dataset is provided, this is ignored.",
-    )
-    ap.add_argument(
-        "--labels",
-        type=str,
-        default="dataset_hira/labels.jsonl",
-        help="(legacy) Single labels jsonl. If --dataset is provided, this is ignored.",
-    )
+    ap.add_argument("--data_dir", type=str, default="dataset_hira",
+                    help="(legacy) Single dataset root dir. If --dataset is provided, this is ignored.")
+    ap.add_argument("--labels", type=str, default="dataset_hira/labels.jsonl",
+                    help="(legacy) Single labels jsonl. If --dataset is provided, this is ignored.")
 
     # New multi-dataset arg
-    ap.add_argument(
-        "--dataset",
-        type=parse_dataset_spec,
-        action="append",
-        default=[],
-        help="Repeatable dataset spec: ROOT:LABELS_JSONL. If provided, overrides --data_dir/--labels.",
-    )
+    ap.add_argument("--dataset", type=parse_dataset_spec, action="append", default=[],
+                    help="Repeatable dataset spec: ROOT:LABELS_JSONL. If provided, overrides --data_dir/--labels.")
 
     ap.add_argument("--out_dir", type=str, default="runs/hira_ctc")
     ap.add_argument("--epochs", type=int, default=10)
@@ -591,7 +405,8 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--num_workers", type=int, default=2)
-    ap.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"])
+    ap.add_argument("--device", type=str, default="cpu",
+                    choices=["cpu", "cuda"])
     ap.add_argument("--val_ratio", type=float, default=0.1)
 
     ap.add_argument("--no_punct", action="store_true")
@@ -600,100 +415,14 @@ def main():
     ap.add_argument("--rnn_hidden", type=int, default=192)
     ap.add_argument("--rnn_layers", type=int, default=2)
 
-    ap.add_argument(
-        "--ink_thresh",
-        type=int,
-        default=245,
-        help="ink threshold for valid width detection (pixels < thresh treated as ink)",
-    )
+    ap.add_argument("--ink_thresh", type=int, default=245,
+                    help="ink threshold for valid width detection (pixels < thresh treated as ink)")
 
     # progress args
-    ap.add_argument(
-        "--log_every",
-        type=int,
-        default=50,
-        help="Print progress every N training steps (in addition to time-based printing).",
-    )
-    ap.add_argument(
-        "--progress_seconds",
-        type=float,
-        default=2.0,
-        help="Print progress at least every N seconds.",
-    )
-
-    # eval args
-    ap.add_argument(
-        "--eval_samples",
-        type=int,
-        default=256,
-        help="How many validation samples to use for CER estimation each epoch (0 disables CER).",
-    )
-
-    # lr scheduler args
-    ap.add_argument(
-        "--lr_scheduler",
-        type=str,
-        default="none",
-        choices=["none", "plateau"],
-        help="Learning-rate scheduler. 'plateau' reduces LR when val_loss stops improving.",
-    )
-    ap.add_argument(
-        "--plateau_mode",
-        type=str,
-        default="min",
-        choices=["min", "max"],
-        help="ReduceLROnPlateau mode. Use 'min' for val_loss.",
-    )
-    ap.add_argument(
-        "--plateau_factor",
-        type=float,
-        default=0.5,
-        help="ReduceLROnPlateau factor. NewLR = LR * factor when triggered.",
-    )
-    ap.add_argument(
-        "--plateau_patience",
-        type=int,
-        default=2,
-        help="ReduceLROnPlateau patience (epochs with no improvement before reducing).",
-    )
-    ap.add_argument(
-        "--plateau_threshold",
-        type=float,
-        default=1e-4,
-        help="ReduceLROnPlateau threshold for measuring new optimum.",
-    )
-    ap.add_argument(
-        "--plateau_threshold_mode",
-        type=str,
-        default="rel",
-        choices=["rel", "abs"],
-        help="ReduceLROnPlateau threshold_mode.",
-    )
-    ap.add_argument(
-        "--plateau_cooldown",
-        type=int,
-        default=0,
-        help="ReduceLROnPlateau cooldown (epochs to wait after LR reduction).",
-    )
-    ap.add_argument(
-        "--min_lr",
-        type=float,
-        default=1e-6,
-        help="Minimum LR for scheduler (lower bound).",
-    )
-
-    # NEW: output controls
-    ap.add_argument(
-        "--log_file",
-        type=str,
-        default="",
-        help="If set, also write logs to this file under out_dir (e.g. 'train.log'). Default: disabled.",
-    )
-    ap.add_argument(
-        "--write_metrics",
-        action="store_true",
-        help="If set, write metrics.jsonl and metrics.csv under out_dir. Default: disabled.",
-    )
+    ap.add_argument("--log_every", type=int, default=50,
+                    help="Print progress every N training steps (in addition to time-based printing).")
+    ap.add_argument("--progress_seconds", type=float, default=2.0,
+                    help="Print progress at least every N seconds.")
 
     args = ap.parse_args()
 
@@ -716,9 +445,8 @@ def main():
         lr=float(args.lr),
         seed=int(args.seed),
         num_workers=int(args.num_workers),
-        device=(
-            "cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu"
-        ),
+        device=("cuda" if args.device ==
+                "cuda" and torch.cuda.is_available() else "cpu"),
         val_ratio=float(args.val_ratio),
         include_punct=(not args.no_punct),
         include_space=(not args.no_space),
@@ -727,77 +455,22 @@ def main():
         ink_thresh=int(args.ink_thresh),
         log_every=int(args.log_every),
         progress_seconds=float(args.progress_seconds),
-        eval_samples=int(args.eval_samples),
-        lr_scheduler=str(args.lr_scheduler),
-        plateau_mode=str(args.plateau_mode),
-        plateau_factor=float(args.plateau_factor),
-        plateau_patience=int(args.plateau_patience),
-        plateau_threshold=float(args.plateau_threshold),
-        plateau_threshold_mode=str(args.plateau_threshold_mode),
-        plateau_cooldown=int(args.plateau_cooldown),
-        min_lr=float(args.min_lr),
-        log_file=_normalize_optional_str(args.log_file),
-        write_metrics=bool(args.write_metrics),
     )
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
-
-    # logger: file output disabled by default
-    logger = setup_logger(cfg.out_dir, log_file=cfg.log_file)
-
-    # metrics: disabled by default (so metrics.jsonl/csv are NOT created unless requested)
-    metrics: Optional[MetricsWriter] = (
-        MetricsWriter(cfg.out_dir) if cfg.write_metrics else None
-    )
-
-    logger.info(
-        "Config: %s",
-        json.dumps(
-            {
-                "datasets": [(str(r), str(l)) for (r, l) in cfg.datasets],
-                "out_dir": str(cfg.out_dir),
-                "epochs": cfg.epochs,
-                "batch_size": cfg.batch_size,
-                "lr": cfg.lr,
-                "seed": cfg.seed,
-                "num_workers": cfg.num_workers,
-                "device": cfg.device,
-                "val_ratio": cfg.val_ratio,
-                "include_punct": cfg.include_punct,
-                "include_space": cfg.include_space,
-                "rnn_hidden": cfg.rnn_hidden,
-                "rnn_layers": cfg.rnn_layers,
-                "ink_thresh": cfg.ink_thresh,
-                "log_every": cfg.log_every,
-                "progress_seconds": cfg.progress_seconds,
-                "eval_samples": cfg.eval_samples,
-                "lr_scheduler": cfg.lr_scheduler,
-                "plateau_mode": cfg.plateau_mode,
-                "plateau_factor": cfg.plateau_factor,
-                "plateau_patience": cfg.plateau_patience,
-                "plateau_threshold": cfg.plateau_threshold,
-                "plateau_threshold_mode": cfg.plateau_threshold_mode,
-                "plateau_cooldown": cfg.plateau_cooldown,
-                "min_lr": cfg.min_lr,
-                "log_file": cfg.log_file,
-                "write_metrics": cfg.write_metrics,
-            },
-            ensure_ascii=False,
-        ),
-    )
 
     random.seed(cfg.seed)
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
 
-    vocab = build_vocab(
-        include_punct=cfg.include_punct, include_space=cfg.include_space
-    )
+    vocab = build_vocab(include_punct=cfg.include_punct,
+                        include_space=cfg.include_space)
     vocab_path = cfg.out_dir / "vocab.json"
     with vocab_path.open("w", encoding="utf-8") as f:
         json.dump({"itos": vocab.itos}, f, ensure_ascii=False, indent=2)
 
     # Build combined dataset
-    ds = MultiJsonlHandwritingDataset(datasets=cfg.datasets, ink_thresh=cfg.ink_thresh)
+    ds = MultiJsonlHandwritingDataset(
+        datasets=cfg.datasets, ink_thresh=cfg.ink_thresh)
     train_idx, val_idx = split_indices(len(ds), cfg.val_ratio, cfg.seed)
 
     # Create subset views without re-reading jsonl files
@@ -815,7 +488,8 @@ def main():
         def __getitem__(self, idx: int):
             root, rel, text = self.items[idx]
             img = Image.open(root / rel).convert("L")
-            valid_w = estimate_valid_width_from_image_L(img, ink_thresh=self.ink_thresh)
+            valid_w = estimate_valid_width_from_image_L(
+                img, ink_thresh=self.ink_thresh)
             arr = np.array(img, dtype=np.float32) / 255.0
             x = torch.from_numpy(arr).unsqueeze(0)
             return x, valid_w, text
@@ -823,77 +497,34 @@ def main():
     train_ds = _Subset(train_items, cfg.ink_thresh)
     val_ds = _Subset(val_items, cfg.ink_thresh)
 
-    def collate(b):
-        return collate_ctc(b, vocab)
+    def collate(b): return collate_ctc(b, vocab)
 
     train_loader = DataLoader(
-        train_ds,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=cfg.num_workers,
-        collate_fn=collate,
-        drop_last=False,
+        train_ds, batch_size=cfg.batch_size, shuffle=True,
+        num_workers=cfg.num_workers, collate_fn=collate, drop_last=False
     )
     val_loader = DataLoader(
-        val_ds,
-        batch_size=cfg.batch_size,
-        shuffle=False,
-        num_workers=cfg.num_workers,
-        collate_fn=collate,
-        drop_last=False,
+        val_ds, batch_size=cfg.batch_size, shuffle=False,
+        num_workers=cfg.num_workers, collate_fn=collate, drop_last=False
     )
 
-    model = CRNNCTC(
-        vocab_size=vocab.size, rnn_hidden=cfg.rnn_hidden, rnn_layers=cfg.rnn_layers
-    ).to(cfg.device)
+    model = CRNNCTC(vocab_size=vocab.size, rnn_hidden=cfg.rnn_hidden,
+                    rnn_layers=cfg.rnn_layers).to(cfg.device)
     opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     ctc_loss = nn.CTCLoss(blank=vocab.blank, zero_infinity=True)
 
-    # LR Scheduler
-    scheduler = None
-    if cfg.lr_scheduler == "plateau":
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            opt,
-            mode=cfg.plateau_mode,
-            factor=float(cfg.plateau_factor),
-            patience=int(cfg.plateau_patience),
-            threshold=float(cfg.plateau_threshold),
-            threshold_mode=cfg.plateau_threshold_mode,
-            cooldown=int(cfg.plateau_cooldown),
-            min_lr=float(cfg.min_lr),
-        )
-        logger.info(
-            "LR Scheduler: ReduceLROnPlateau(mode=%s, factor=%s, patience=%s, threshold=%s, threshold_mode=%s, cooldown=%s, min_lr=%s)",
-            cfg.plateau_mode,
-            str(cfg.plateau_factor),
-            str(cfg.plateau_patience),
-            str(cfg.plateau_threshold),
-            cfg.plateau_threshold_mode,
-            str(cfg.plateau_cooldown),
-            str(cfg.min_lr),
-        )
-    else:
-        logger.info("LR Scheduler: none")
-
     best_val_loss = float("inf")
-    best_val_cer = float("inf")
     ckpt = cfg.out_dir / "model_state_dict.pt"
     ts_path = cfg.out_dir / "model_torchscript.pt"
 
-    pcfg = ProgressConfig(
-        log_every=cfg.log_every, progress_seconds=cfg.progress_seconds
-    )
-
-    t0_all = time.time()
+    pcfg = ProgressConfig(log_every=cfg.log_every,
+                          progress_seconds=cfg.progress_seconds)
 
     for epoch in range(1, cfg.epochs + 1):
-        epoch_t0 = time.time()
-
         # ---- Train ----
         model.train()
-        tr = EpochProgress(
-            total_steps=len(train_loader), total_samples=len(train_ds), pcfg=pcfg
-        )
+        tr = EpochProgress(total_steps=len(train_loader),
+                           total_samples=len(train_ds), pcfg=pcfg)
 
         for xb, valid_widths, targets, target_lens in train_loader:
             xb = xb.to(cfg.device)
@@ -901,7 +532,8 @@ def main():
             target_lens = target_lens.to(cfg.device)
 
             log_probs = model(xb)  # [T,B,V]
-            input_lens = width_to_time_steps(valid_widths).to(cfg.device)  # [B]
+            input_lens = width_to_time_steps(
+                valid_widths).to(cfg.device)  # [B]
 
             loss = ctc_loss(log_probs, targets, input_lens, target_lens)
 
@@ -909,19 +541,19 @@ def main():
             loss.backward()
             opt.step()
 
-            tr.update(batch_size=int(xb.shape[0]), loss_value=float(loss.item()))
+            tr.update(batch_size=int(xb.shape[0]),
+                      loss_value=float(loss.item()))
 
             if tr.should_print():
-                logger.info(tr.render(prefix=f"[epoch {epoch}] train:"))
+                print(tr.render(prefix=f"[epoch {epoch}] train:"), flush=True)
                 tr.mark_printed()
 
         train_loss = tr.loss_sum / max(1, tr.step)
 
         # ---- Val ----
         model.eval()
-        va = EpochProgress(
-            total_steps=len(val_loader), total_samples=len(val_ds), pcfg=pcfg
-        )
+        va = EpochProgress(total_steps=len(val_loader),
+                           total_samples=len(val_ds), pcfg=pcfg)
         with torch.no_grad():
             for xb, valid_widths, targets, target_lens in val_loader:
                 xb = xb.to(cfg.device)
@@ -932,138 +564,39 @@ def main():
                 input_lens = width_to_time_steps(valid_widths).to(cfg.device)
                 loss = ctc_loss(log_probs, targets, input_lens, target_lens)
 
-                va.update(batch_size=int(xb.shape[0]), loss_value=float(loss.item()))
+                va.update(batch_size=int(
+                    xb.shape[0]), loss_value=float(loss.item()))
 
                 if va.should_print():
-                    logger.info(va.render(prefix=f"[epoch {epoch}]  val:"))
+                    print(
+                        va.render(prefix=f"[epoch {epoch}]  val:"), flush=True)
                     va.mark_printed()
 
         val_loss = va.loss_sum / max(1, va.step)
 
-        # ---- CER computation (lightweight pass) ----
-        val_cer = None
-        if cfg.eval_samples > 0:
-            model.eval()
-            need = int(cfg.eval_samples)
-            got = 0
-            cer_sum2 = 0.0
+        print(
+            f"[epoch {epoch}] summary: train_loss={train_loss:.4f} val_loss={val_loss:.4f}", flush=True)
 
-            with torch.no_grad():
-                for i in range(0, len(val_ds)):
-                    if got >= need:
-                        break
-                    x, valid_w, gt = val_ds[i]
-                    xb1 = x.unsqueeze(0).to(cfg.device)  # [1,1,H,W]
-                    log_probs = model(xb1)  # [T,1,V]
-                    input_lens = width_to_time_steps(
-                        torch.tensor([int(valid_w)], dtype=torch.long)
-                    ).to(cfg.device)
-                    pred = greedy_decode_batch_ctc(log_probs, input_lens, vocab)[0]
-                    cer_sum2 += cer(pred, gt)
-                    got += 1
-
-            val_cer = cer_sum2 / max(1, got)
-
-        # ---- LR Scheduler step (after val) ----
-        lr_before = _get_current_lr(opt)
-        if scheduler is not None:
-            # plateau uses validation metric
-            scheduler.step(val_loss)
-        lr_after = _get_current_lr(opt)
-        if lr_after != lr_before:
-            logger.info(
-                "[epoch %d] LR updated: %.8f -> %.8f",
-                epoch,
-                float(lr_before),
-                float(lr_after),
-            )
-
-        epoch_sec = time.time() - epoch_t0
-        all_sec = time.time() - t0_all
-
-        # summary
-        if val_cer is None:
-            logger.info(
-                "[epoch %d] summary: train_loss=%.4f val_loss=%.4f lr=%.8f epoch=%s total=%s",
-                epoch,
-                train_loss,
-                val_loss,
-                float(lr_after),
-                _fmt_time(epoch_sec),
-                _fmt_time(all_sec),
-            )
-        else:
-            logger.info(
-                "[epoch %d] summary: train_loss=%.4f val_loss=%.4f val_CER=%.4f lr=%.8f epoch=%s total=%s",
-                epoch,
-                train_loss,
-                val_loss,
-                float(val_cer),
-                float(lr_after),
-                _fmt_time(epoch_sec),
-                _fmt_time(all_sec),
-            )
-
-        # write metrics row ONLY if enabled
-        if metrics is not None:
-            row = {
-                "epoch": epoch,
-                "train_loss": float(train_loss),
-                "val_loss": float(val_loss),
-                "val_cer": None if val_cer is None else float(val_cer),
-                "lr": float(lr_after),
-                "batch_size": int(cfg.batch_size),
-                "device": str(cfg.device),
-                "train_samples": int(len(train_ds)),
-                "val_samples": int(len(val_ds)),
-                "epoch_seconds": float(epoch_sec),
-                "total_seconds": float(all_sec),
-                "lr_scheduler": str(cfg.lr_scheduler),
-            }
-            metrics.write(row)
-
-        # checkpoint
-        improved = val_loss < best_val_loss
-        if improved:
+        if val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save(model.state_dict(), ckpt)
-            logger.info(
-                "[epoch %d] best checkpoint saved -> %s (best_val_loss=%.6f)",
-                epoch,
-                str(ckpt),
-                float(best_val_loss),
-            )
-
-        if val_cer is not None and float(val_cer) < best_val_cer:
-            best_val_cer = float(val_cer)
-            logger.info(
-                "[epoch %d] new best val_CER -> %.6f", epoch, float(best_val_cer)
-            )
+            print(
+                f"[epoch {epoch}] best checkpoint saved -> {ckpt}", flush=True)
 
     # TorchScript export
-    logger.info("Export TorchScript...")
-
     state = torch.load(ckpt, map_location="cpu")
     model.load_state_dict(state)
 
-    model = model.to("cpu")  # 必須
+    model = model.to("cpu")          # ★これを必ず入れる
     model.eval()
 
     scripted = torch.jit.script(model)
     scripted.save(str(ts_path))
 
-    if metrics is not None:
-        metrics.close()
-
-    logger.info("Saved:")
-    logger.info(" - %s", str(ckpt))
-    logger.info(" - %s", str(ts_path))
-    logger.info(" - %s", str(vocab_path))
-    if cfg.log_file:
-        logger.info(" - %s", str(cfg.out_dir / cfg.log_file))
-    if cfg.write_metrics:
-        logger.info(" - %s", str(cfg.out_dir / "metrics.jsonl"))
-        logger.info(" - %s", str(cfg.out_dir / "metrics.csv"))
+    print("Saved:")
+    print(" -", ckpt)
+    print(" -", ts_path)
+    print(" -", vocab_path)
 
 
 if __name__ == "__main__":
