@@ -83,16 +83,7 @@ python3 train_hiragana_crnn_ctc.py --dataset dataset_hira:dataset_hira/labels.js
 
 ```bash
 
-python3 train_hiragana_crnn_ctc.py --dataset dataset_hira:dataset_hira/labels.jsonl --dataset dataset_tomoe_hira:dataset_tomoe_hira/labels.jsonl --dataset dataset_hira_font:dataset_hira_font/labels.jsonl --out_dir runs/hira_ctc_multi_fonts --epochs 200 --batch_size 32 --lr 1e-3 --device cuda --min_w 96 --diag_every 100 --log_every 20 --preview_every 1 --preview_samples 12
-
-```
-
-```bash
-python3 preprocess_unpacked_jsonl.py --in_dir ETL4/ETL4C_unpack --out_dir dataset_etl4c_norm --white_bg yes --invert auto --autocontrast 1.0 --ink_thresh 250 --target_h 32 --max_w 512 --blur 0.6
-
-
-python3 preprocess_unpacked_jsonl.py --in_dir ETL4/ETL4C_unpack --out_dir dataset_etl4c_norm --white_bg yes --include_iwiwe
-
+python3 train_hiragana_crnn_ctc.py --dataset dataset_hira:dataset_hira/labels.jsonl --dataset dataset_tomoe_hira:dataset_tomoe_hira/labels.jsonl --dataset dataset_hira_font:dataset_hira_font/labels.jsonl --out_dir runs/hira_ctc_multi_fonts --epochs 200 --batch_size 64 --lr 5e-4 --device cuda --min_w 96 --diag_every 100 --log_every 20 --preview_every 1 --preview_samples 12
 
 ```
 
