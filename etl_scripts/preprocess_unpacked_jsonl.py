@@ -28,8 +28,34 @@
 #   This script includes "white background normalization" (Otsu-based) to
 #   force background to 255 before bbox cropping, which removes the frame.
 #
-# Extra (requested):
-#   Exclude samples whose label is one of: ゐ, ゑ, ヰ, ヱ  (option: --exclude_iwiwe)
+# Extra:
+#   Exclude samples whose label is one of: ゐ, ゑ, ヰ, ヱ
+#     - default: excluded
+#     - override by: --include_iwiwe
+#
+# ETL8B mode (requested):
+#   ETL8B is often "black background + white ink" (1-bit). To make preprocessing
+#   identical to collector (white bg + black ink), you should force inversion.
+#   - Use: --etl8b_mode
+#     This forces:
+#       invert=yes
+#       autocontrast=0
+#       white_bg=no
+#
+# If you still see a faint frame after inversion, you can enable:
+#   --etl8b_bg_fix  (equivalent to white_bg=yes)
+#
+# Additional requested option:
+#   Exclude dakuten/handakuten variants (濁点・半濁点) for hiragana/katakana.
+#   - default: OFF
+#   - enable by: --exclude_dakuten_handakuten
+#
+# Implementation:
+#   - Unicode normalization NFD decomposes e.g. "が" -> "か" + U+3099
+#   - handakuten is U+309A
+#   - We exclude samples whose label contains U+3099 or U+309A after NFD
+#
+# ------------------------------------------------------------------------------
 
 from __future__ import annotations
 
@@ -37,6 +63,7 @@ import argparse
 import json
 import sys
 import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -80,6 +107,9 @@ class PrepConfig:
 
     # exclude labels: ゐ ゑ ヰ ヱ
     exclude_iwiwe: bool = True
+
+    # exclude dakuten/handakuten variants (が ぱ など)
+    exclude_dakuten_handakuten: bool = False
 
 
 # ---------------- Utilities ----------------
@@ -129,16 +159,47 @@ def _resize_keep_aspect_to_h(img_L: Image.Image, target_h: int) -> Image.Image:
     return img_L.resize((new_w, target_h), resample=Image.Resampling.BILINEAR)
 
 
-def _maybe_invert_auto(im_L: Image.Image) -> Image.Image:
+# ---------------- Label filters ----------------
+
+_DAKUTEN = "\u3099"      # combining dakuten
+_HANDAKUTEN = "\u309A"   # combining handakuten
+
+
+def _has_dakuten_handakuten(text: str) -> bool:
     """
-    Auto decide inversion based on image statistics.
-    - If background is dark (median < 128), invert it.
+    Returns True if text contains dakuten/handakuten (濁点/半濁点) marks,
+    including composed kana like 'が'/'ぱ' by checking NFD decomposition.
     """
+    if not text:
+        return False
+    decomposed = unicodedata.normalize("NFD", text)
+    return (_DAKUTEN in decomposed) or (_HANDAKUTEN in decomposed)
+
+
+# ---------------- Invert (robust auto) ----------------
+
+def _maybe_invert_auto(im_L: Image.Image) -> Tuple[Image.Image, Dict[str, Any]]:
+    """
+    Auto decide inversion based on robust statistics.
+
+    For ETL-like samples:
+      - If background is dark, most pixels are < 128 (high dark_ratio).
+      - If background is light, dark_ratio is low.
+    """
+    dbg: Dict[str, Any] = {}
     arr = np.array(im_L, dtype=np.uint8)
-    med = float(np.median(arr))
-    if med < 128.0:
-        return ImageOps.invert(im_L)
-    return im_L
+    if arr.size == 0:
+        return im_L, {"auto_invert": False, "reason": "empty"}
+
+    dark_ratio = float(np.mean(arr < 128))
+    median = float(np.median(arr))
+    dbg["auto_invert_dark_ratio"] = dark_ratio
+    dbg["auto_invert_median"] = median
+
+    # Black background => dark_ratio tends to be very high.
+    if dark_ratio > 0.55:
+        return ImageOps.invert(im_L), {**dbg, "auto_invert": True}
+    return im_L, {**dbg, "auto_invert": False}
 
 
 # ---------------- White background normalization (frame removal) ----------------
@@ -222,6 +283,8 @@ def _whiten_background_otsu(im_L: Image.Image) -> Tuple[Image.Image, int]:
     return (Image.fromarray(out.astype(np.uint8)), thr)
 
 
+# ---------------- Core normalization ----------------
+
 def normalize_like_collector(img: Image.Image, cfg: PrepConfig) -> Tuple[Image.Image, Dict[str, Any]]:
     """
     Convert grayscale samples into the same "collector" style.
@@ -242,13 +305,10 @@ def normalize_like_collector(img: Image.Image, cfg: PrepConfig) -> Tuple[Image.I
         im = ImageOps.invert(im)
         debug["inverted"] = True
     elif inv == "auto":
-        before_med = float(np.median(np.asarray(im, dtype=np.uint8)))
-        im2 = _maybe_invert_auto(im)
-        after_med = float(np.median(np.asarray(im2, dtype=np.uint8)))
+        im2, dbg = _maybe_invert_auto(im)
+        debug.update(dbg)
         im = im2
-        debug["auto_invert_before_median"] = before_med
-        debug["auto_invert_after_median"] = after_med
-        debug["inverted"] = (after_med != before_med)
+        debug["inverted"] = bool(debug.get("auto_invert", False))
     else:
         debug["inverted"] = False
 
@@ -294,8 +354,7 @@ def normalize_like_collector(img: Image.Image, cfg: PrepConfig) -> Tuple[Image.I
         cropped = cropped.crop(tb2)
 
     if cfg.blur_radius and cfg.blur_radius > 0:
-        cropped = cropped.filter(
-            ImageFilter.GaussianBlur(radius=float(cfg.blur_radius)))
+        cropped = cropped.filter(ImageFilter.GaussianBlur(radius=float(cfg.blur_radius)))
         debug["blur_radius"] = float(cfg.blur_radius)
     else:
         debug["blur_radius"] = 0.0
@@ -338,32 +397,42 @@ def process_one(
     rec: Dict[str, Any],
     cfg: PrepConfig,
     seq_index: int,
-) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], str]:
+    """
+    Returns:
+      (out_rec or None, debug_rec or None, status)
+    status: "ok" | "skip_empty" | "skip_excluded" | "skip_dakuten" | "missing" | "failed"
+    """
     rel = str(rec.get("path", "")).strip()
     text = str(rec.get("text", "")).strip()
     if not rel or not text:
-        return None, None
+        return None, None, "skip_empty"
 
-    # ★ requested exclusion (option 2)
     if cfg.exclude_iwiwe and text in ("ゐ", "ゑ", "ヰ", "ヱ"):
-        return None, None
+        return None, None, "skip_excluded"
+
+    if cfg.exclude_dakuten_handakuten and _has_dakuten_handakuten(text):
+        return None, None, "skip_dakuten"
 
     try:
         rel_p = _safe_rel_image_path(rel)
     except Exception:
-        return None, None
+        return None, None, "failed"
 
     src = in_root / rel_p
     if not src.exists():
-        return None, None
+        return None, None, "missing"
 
     try:
         im = Image.open(src)
         im.load()
     except Exception:
-        return None, None
+        return None, None, "failed"
 
-    out_img, dbg = normalize_like_collector(im, cfg)
+    try:
+        out_img, dbg = normalize_like_collector(im, cfg)
+    except Exception:
+        return None, None, "failed"
 
     if cfg.preserve_paths:
         dst_rel = rel_p
@@ -376,7 +445,7 @@ def process_one(
     try:
         out_img.save(dst)
     except Exception:
-        return None, None
+        return None, None, "failed"
 
     out_rec = {"path": str(dst_rel).replace("\\", "/"), "text": text}
     dbg_out = {
@@ -385,7 +454,7 @@ def process_one(
         "text": text,
         **(dbg or {}),
     }
-    return out_rec, dbg_out
+    return out_rec, dbg_out, "ok"
 
 
 def main() -> None:
@@ -394,9 +463,9 @@ def main() -> None:
     )
 
     ap.add_argument("--in_dir", type=str, required=True,
-                    help="unpack output directory (e.g. ETL4/ETL4C_unpack)")
+                    help="unpack output directory (contains labels.jsonl and images/)")
     ap.add_argument("--out_dir", type=str, required=True,
-                    help="output dataset directory (e.g. dataset_etl4c_norm)")
+                    help="output dataset directory (e.g. dataset_etl8b_norm)")
 
     ap.add_argument("--labels", type=str, default="",
                     help="optional path to input labels.jsonl (default: auto-detect in in_dir)")
@@ -423,11 +492,21 @@ def main() -> None:
     ap.add_argument("--debug_jsonl", type=str, default="",
                     help="optional path to write per-sample debug jsonl (e.g. out_dir/debug.jsonl)")
 
-    # ★ requested exclusion flag (default ON)
+    # exclusion flags (default ON for iwiwe)
     ap.add_argument("--exclude_iwiwe", action="store_true",
                     help="exclude labels: ゐ, ゑ, ヰ, ヱ (default: ON)")
     ap.add_argument("--include_iwiwe", action="store_true",
                     help="do NOT exclude ゐ/ゑ/ヰ/ヱ (overrides --exclude_iwiwe)")
+
+    # ---- Dakuten/Handakuten exclusion (requested) ----
+    ap.add_argument("--exclude_dakuten_handakuten", action="store_true",
+                    help="exclude dakuten/handakuten variants (が ぱ etc.) (default: OFF)")
+
+    # ---- ETL8B requested mode ----
+    ap.add_argument("--etl8b_mode", action="store_true",
+                    help="ETL8B mode (collector-compatible): force invert=yes, autocontrast=0, white_bg=no")
+    ap.add_argument("--etl8b_bg_fix", action="store_true",
+                    help="ETL8B background fix: force white_bg=yes (use if a faint frame remains)")
 
     args = ap.parse_args()
 
@@ -442,26 +521,39 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "images").mkdir(parents=True, exist_ok=True)
 
-    # default: exclude ON
+    # default: exclude iwiwe ON unless include_iwiwe
     exclude_iwiwe = True
     if args.exclude_iwiwe:
         exclude_iwiwe = True
     if args.include_iwiwe:
         exclude_iwiwe = False
 
+    # ---- Apply ETL8B overrides (requested) ----
+    invert = str(args.invert)
+    autocontrast = float(args.autocontrast)
+    white_bg = str(args.white_bg)
+
+    if bool(args.etl8b_mode):
+        invert = "yes"
+        autocontrast = 0.0
+        white_bg = "no"
+
+    if bool(args.etl8b_bg_fix):
+        white_bg = "yes"
+
     cfg = PrepConfig(
         target_h=int(args.target_h),
         max_w=int(args.max_w),
         blur_radius=float(args.blur),
         ink_thresh=int(args.ink_thresh),
-        invert=str(args.invert),
-        autocontrast_cutoff=float(args.autocontrast),
+        invert=invert,
+        autocontrast_cutoff=autocontrast,
         force_mode_L=True,
         preserve_paths=(not bool(args.rewrite_paths)),
-        white_bg=str(args.white_bg),
-        white_bg_auto_min_white_ratio=float(
-            args.white_bg_auto_min_white_ratio),
+        white_bg=white_bg,
+        white_bg_auto_min_white_ratio=float(args.white_bg_auto_min_white_ratio),
         exclude_iwiwe=bool(exclude_iwiwe),
+        exclude_dakuten_handakuten=bool(args.exclude_dakuten_handakuten),
     )
 
     rows_in = list(read_jsonl(labels_p))
@@ -469,49 +561,43 @@ def main() -> None:
 
     out_rows: List[Dict[str, Any]] = []
     debug_rows: List[Dict[str, Any]] = []
+
     missing = 0
     failed = 0
-    skipped_iwiwe = 0
-
+    skipped_empty = 0
+    skipped_excluded = 0
+    skipped_dakuten = 0
     white_bg_applied_count = 0
 
     t0 = time.time()
     for i, rec in enumerate(rows_in, 1):
-        # detect skip reason for counters
-        txt = str(rec.get("text", "")).strip()
-        if cfg.exclude_iwiwe and txt in ("ゐ", "ゑ", "ヰ", "ヱ"):
-            skipped_iwiwe += 1
-            continue
+        out_rec, dbg, status = process_one(
+            in_dir, out_dir, rec, cfg, seq_index=len(out_rows)
+        )
 
-        out_rec, dbg = process_one(
-            in_dir, out_dir, rec, cfg, seq_index=len(out_rows))
-        if out_rec is None:
-            rel = str(rec.get("path", "")).strip()
-            if rel:
-                try:
-                    rel_p = _safe_rel_image_path(rel)
-                    if not (in_dir / rel_p).exists():
-                        missing += 1
-                    else:
-                        failed += 1
-                except Exception:
-                    failed += 1
-            else:
-                failed += 1
-            continue
-
-        out_rows.append(out_rec)
-
-        if dbg is not None:
-            debug_rows.append(dbg)
-            if bool(dbg.get("white_bg_applied", False)):
-                white_bg_applied_count += 1
+        if status == "ok":
+            out_rows.append(out_rec)  # type: ignore[arg-type]
+            if dbg is not None:
+                debug_rows.append(dbg)
+                if bool(dbg.get("white_bg_applied", False)):
+                    white_bg_applied_count += 1
+        elif status == "missing":
+            missing += 1
+        elif status == "skip_excluded":
+            skipped_excluded += 1
+        elif status == "skip_dakuten":
+            skipped_dakuten += 1
+        elif status == "skip_empty":
+            skipped_empty += 1
+        else:
+            failed += 1
 
         if args.log_every > 0 and (i % int(args.log_every) == 0):
             dt = time.time() - t0
             print(
                 f"[{i}/{total}] ok={len(out_rows)} missing={missing} failed={failed} "
-                f"skipped_iwiwe={skipped_iwiwe} white_bg_applied={white_bg_applied_count} elapsed={dt:.1f}s",
+                f"skip_empty={skipped_empty} skip_excluded={skipped_excluded} skip_dakuten={skipped_dakuten} "
+                f"white_bg_applied={white_bg_applied_count} elapsed={dt:.1f}s",
                 file=sys.stderr
             )
 
@@ -538,6 +624,9 @@ def main() -> None:
             "saved_records": len(out_rows),
             "missing_images": missing,
             "failed_records": failed,
+            "skipped_empty": skipped_empty,
+            "skipped_excluded_iwiwe": skipped_excluded,
+            "skipped_dakuten_handakuten": skipped_dakuten,
             "preserve_paths": cfg.preserve_paths,
         },
         "preprocess": {
@@ -551,7 +640,9 @@ def main() -> None:
             "white_bg_auto_min_white_ratio": cfg.white_bg_auto_min_white_ratio,
             "white_bg_applied_count": white_bg_applied_count,
             "exclude_iwiwe": cfg.exclude_iwiwe,
-            "skipped_iwiwe": skipped_iwiwe,
+            "exclude_dakuten_handakuten": cfg.exclude_dakuten_handakuten,
+            "etl8b_mode": bool(args.etl8b_mode),
+            "etl8b_bg_fix": bool(args.etl8b_bg_fix),
         },
     }
     (out_dir / "meta.json").write_text(
@@ -562,7 +653,8 @@ def main() -> None:
     dt = time.time() - t0
     print(
         f"Done. saved={len(out_rows)} / total={total} missing={missing} failed={failed} "
-        f"skipped_iwiwe={skipped_iwiwe} white_bg_applied={white_bg_applied_count} elapsed={dt:.1f}s"
+        f"skip_empty={skipped_empty} skip_excluded={skipped_excluded} skip_dakuten={skipped_dakuten} "
+        f"white_bg_applied={white_bg_applied_count} elapsed={dt:.1f}s"
     )
     print(f"Output: {out_dir}")
 
