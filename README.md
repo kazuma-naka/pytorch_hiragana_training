@@ -60,6 +60,17 @@ python collect_hiragana_tk.py --out_dir dataset_hira
 python3 build_dataset_from_android_pictures.py --src_root exported/Pictures/hand_writting_save_img --out_dir dataset_hira --prefix label_ --target_h 32 --max_w 512 --ink_thresh 245 --pad 0 --blur 0.0
 ```
 
+```bash
+python3 collect_hiragana_tk.py --out_dir dataset_hira_font --auto_elastic_alpha 18 --auto_elastic_sigma 6 --auto_scale_min 0.8 --auto_scale_max 1 --auto_erode_prob 0 --auto_edge_blur 0 --auto_elastic_prob 0 --auto_pressure_prob 0 --auto_blur 0 --auto_interval_ms 1 --auto_repeat_per_token 200 --auto_thicken_min 1 --auto_thicken_max 2 --auto_noise 0 --auto_font_ttf_list "$(printf '%s ' fonts/*.ttf fonts/*.otf 2>/dev/null)"
+
+python3 collect_hiragana_tk.py --batch --tomoe --tomoe_tdic tomoe_data/hiragana.tdic --tomoe_per_char 200 --out_dir dataset_tomoe_hira --target_h 32 --max_w 512 --tomoe_pen_width_min 8 --tomoe_pen_width_max 16 --auto_scale_min 0.8 --auto_scale_max 1.2 --tomoe_point_jitter 0.6 --tomoe_drop_point_prob 0 --auto_pressure_prob 0 --auto_elastic_prob 0.1 --auto_elastic_alpha 6 --auto_elastic_sigma 3 --auto_erode_prob 0.3 --auto_edge_blur 0.2 --auto_blur 0.3 --auto_rotate_deg 6 --auto_noise 0.2 --tomoe_stroke_perturb_prob 0.8 --tomoe_trim_prob 0.35 --tomoe_trim_max_frac 0.18 --tomoe_extend_prob 0.25 --tomoe_extend_max_frac 0.12 --tomoe_curve_prob 0.50 --tomoe_curve_amp_px 2.2 --tomoe_curve_freq_min 0.8 --tomoe_curve_freq_max 2.0 --tomoe_perturb_resample_n 56
+
+```
+
+```bash
+python3 collect_hiragana_tk.py --auto_elastic_alpha 18 --auto_elastic_sigma 6 --auto_scale_min 0.5 --auto_scale_max 2 --auto_erode_prob 0 --auto_edge_blur 0 --auto_elastic_prob 0 --auto_pressure_prob 0 --auto_blur 0 --auto_interval_ms 1 --auto_repeat_per_token 2000 --auto_thicken_min 2 --auto_thicken_max 4 --auto_noise 0 --auto_font_ttf_list "$(printf '%s ' fonts/*.ttf fonts/*.otf 2>/dev/null)"
+```
+
 #### 2) 学習（CRNN + CTC）
 
 ```bash
@@ -67,39 +78,12 @@ python3 train_hiragana_crnn_ctc.py   --data_dir dataset_hira   --labels dataset_
 ```
 
 ```bash
-python3 collect_hiragana_tk.py --auto_elastic_alpha 18 --auto_elastic_sigma 6 --auto_scale_min 0.5 --auto_scale_max 2 --auto_erode_prob 0 --auto_edge_blur 0 --auto_elastic_prob 0 --auto_pressure_prob 0 --auto_blur 0 --auto_interval_ms 1 --auto_repeat_per_token 2000 --auto_thicken_min 2 --auto_thicken_max 4 --auto_noise 0 --auto_font_ttf_list "$(printf '%s ' fonts/*.ttf fonts/*.otf 2>/dev/null)"
-```
-
-```bash
-python3 collect_hiragana_tk.py --batch --tomoe --tomoe_tdic tomoe_data/hiragana.tdic --tomoe_per_char 200 --out_dir dataset_tomoe_hira --target_h 32 --max_w 512 --tomoe_pen_width_min 14 --tomoe_pen_width_max 22 --tomoe_point_jitter 0.6 --tomoe_drop_point_prob 0 --auto_pressure_prob 0 --auto_elastic_prob 0.2 --auto_elastic_alpha 6 --auto_elastic_sigma 3 --auto_erode_prob 0 --auto_edge_blur 0.2 --auto_blur 0.3 --auto_rotate_deg 2 --auto_noise 0.002
-```
-
-```bash
-python3 train_hiragana_crnn_ctc.py --data_dir dataset_tomoe_hira --labels dataset_tomoe_hira/labels.jsonl --out_dir runs/hira_ctc_from_dataset_tomoe_hira --epochs 200 --batch_size 32 --lr 1e-3 --device cpu
-
+python3 train_hiragana_crnn_ctc.py --dataset dataset_hira:dataset_hira/labels.jsonl --out_dir runs/hira_ctc_multi --epochs 200 --batch_size 64 --lr 5e-4 --device cuda --min_w 96 --diag_every 100 --log_every 20 --preview_every 1 --preview_samples 12
 ```
 
 ```bash
 
-python3 train_hiragana_crnn_ctc.py --dataset dataset_hira:dataset_hira/labels.jsonl --dataset dataset_tomoe_hira:dataset_tomoe_hira/labels.jsonl --out_dir runs/hira_ctc_multi --epochs 200 --batch_size 32 --lr 1e-3 --device cuda
-
-
-```
-
-```bash
-python3 collect_hiragana_tk.py --out_dir dataset_hira_font --auto_elastic_alpha 18 --auto_elastic_sigma 6 --auto_scale_min 0.8 --auto_scale_max 1 --auto_erode_prob 0 --auto_edge_blur 0 --auto_elastic_prob 0 --auto_pressure_prob 0 --auto_blur 0 --auto_interval_ms 1 --auto_repeat_per_token 200 --auto_thicken_min 1 --auto_thicken_max 2 --auto_noise 0 --auto_font_ttf_list "$(printf '%s ' fonts/*.ttf fonts/*.otf 2>/dev/null)"
-
-python3 collect_hiragana_tk.py --batch --tomoe --tomoe_tdic tomoe_data/hiragana.tdic --tomoe_per_char 200 --out_dir dataset_tomoe_hira --target_h 32 --max_w 512 --tomoe_pen_width_min 12 --tomoe_pen_width_max 14 --auto_scale_min 0.5 --auto_scale_max 1.5 --tomoe_point_jitter 0.6 --tomoe_drop_point_prob 0 --auto_pressure_prob 0 --auto_elastic_prob 0.1 --auto_elastic_alpha 6 --auto_elastic_sigma 3 --auto_erode_prob 0.3 --auto_edge_blur 0.2 --auto_blur 0.3 --auto_rotate_deg 6 --auto_noise 0.2 --tomoe_stroke_perturb_prob 0.8 --tomoe_trim_prob 0.35 --tomoe_trim_max_frac 0.18 --tomoe_extend_prob 0.25 --tomoe_extend_max_frac 0.12 --tomoe_curve_prob 0.50 --tomoe_curve_amp_px 2.2 --tomoe_curve_freq_min 0.8 --tomoe_curve_freq_max 2.0 --tomoe_perturb_resample_n 56
-
-```
-
-```bash
-
-python3 train_hiragana_crnn_ctc.py --dataset dataset_hira:dataset_hira/labels.jsonl --dataset dataset_tomoe_hira:dataset_tomoe_hira/labels.jsonl --out_dir runs/hira_ctc_multi --epochs 200 --batch_size 32 --lr 1e-3 --device cuda
-
-python3 train_hiragana_crnn_ctc.py --dataset dataset_hira:dataset_hira/labels.jsonl --dataset dataset_tomoe_hira:dataset_tomoe_hira/labels.jsonl --dataset dataset_hira_font:dataset_hira_font/labels.jsonl --out_dir runs/hira_ctc_multi_fonts --epochs 200 --batch_size 32 --lr 1e-3 --device cuda
-
- python3 train_hiragana_crnn_ctc.py --dataset dataset_hira:dataset_hira/labels.jsonl --dataset dataset_tomoe_hira:dataset_tomoe_hira/labels.jsonl --dataset dataset_etl4c_norm:dataset_etl4c_norm/labels.jsonl --out_dir runs/hira_ctc_multi_tomoe_etl4 --epochs 200 --batch_size 32 --lr 1e-3 --device cuda
+python3 train_hiragana_crnn_ctc.py --dataset dataset_hira:dataset_hira/labels.jsonl --dataset dataset_tomoe_hira:dataset_tomoe_hira/labels.jsonl --dataset dataset_hira_font:dataset_hira_font/labels.jsonl --out_dir runs/hira_ctc_multi_fonts --epochs 200 --batch_size 32 --lr 1e-3 --device cuda --min_w 96 --diag_every 100 --log_every 20 --preview_every 1 --preview_samples 12
 
 ```
 
