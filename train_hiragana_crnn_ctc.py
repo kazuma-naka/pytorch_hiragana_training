@@ -2,20 +2,19 @@
 # -*- coding: utf-8 -*-
 # train_hiragana_crnn_ctc.py
 #
-# Changes (accuracy-focused for 1-char CTC):
-# 1) Increase time steps by reducing width downsample: W//4 -> W//2
-#    - ConvFeature: 2nd pool changed (2,2) -> (2,1)
-#    - width_to_time_steps changed //4 -> //2
-# 2) Optional: min width padding at training time to avoid extremely tiny widths
-#    - --min_w (default 96). Set 0 to disable.
+# CRNN + CTC trainer (supports kanji by building vocab from labels.jsonl)
 #
-# Added (training correctness diagnostics):
-# - Shape/time-step logs (xb/log_probs/T/input_lens/target_lens)
-# - CTC validity checks: input_lens < target_lens count, clamp input_lens to T
-# - NaN/Inf detection for loss/log_probs
-# - Grad-norm logging
-# - Validation metrics: exact match rate + CER (greedy decode)
-# - Prediction previews from validation set
+# Key points:
+# - vocab_mode=from_datasets (default): build vocab from all characters found in dataset labels (supports kanji).
+# - vocab_mode=hiragana: legacy fixed hiragana vocab (+punct/space flags).
+# - min_w padding: optional training-time padding to avoid tiny widths -> tiny time steps.
+# - Diagnostics: shape/time-step logs, NaN/Inf checks, grad norm, val CER/exact, previews.
+#
+# Example:
+# python3 train_hiragana_crnn_ctc.py \
+#   --dataset dataset_tomoe_all_hira_digits_kanji:dataset_tomoe_all_hira_digits_kanji/labels.jsonl \
+#   --out_dir runs/hira_ctc_tomoe_kanji --epochs 200 --batch_size 32 --lr 1e-3 --device cuda \
+#   --min_w 96 --diag_every 100 --log_every 20 --preview_every 1 --preview_samples 12
 
 from __future__ import annotations
 
@@ -23,6 +22,7 @@ import argparse
 import json
 import random
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
@@ -38,15 +38,19 @@ from torch.utils.data import Dataset, DataLoader
 
 # ---------------- Vocabulary ----------------
 
-def hiragana_charset(include_punct: bool = True, include_space: bool = True) -> List[str]:
-    chars = []
+
+def hiragana_charset(
+    include_punct: bool = True, include_space: bool = True
+) -> List[str]:
+    chars: List[str] = []
     for cp in range(0x3041, 0x3097):  # ぁ..ゖ
         chars.append(chr(cp))
     if include_punct:
         chars += ["ー", "、", "。"]
     if include_space:
         chars += [" "]
-    out, seen = [], set()
+    out: List[str] = []
+    seen = set()
     for c in chars:
         if c not in seen:
             out.append(c)
@@ -56,8 +60,8 @@ def hiragana_charset(include_punct: bool = True, include_space: bool = True) -> 
 
 @dataclass
 class Vocab:
-    itos: List[str]          # index -> char (1..)
-    stoi: Dict[str, int]     # char -> index
+    itos: List[str]  # index -> char (1..)
+    stoi: Dict[str, int]  # char -> index
 
     @property
     def blank(self) -> int:
@@ -68,16 +72,17 @@ class Vocab:
         return 1 + len(self.itos)  # blank + chars
 
     def encode(self, s: str) -> List[int]:
-        ids = []
+        ids: List[int] = []
         for ch in s:
-            if ch not in self.stoi:
+            v = self.stoi.get(ch)
+            if v is None:
                 raise ValueError(f"Unknown char in label: '{ch}'")
-            ids.append(self.stoi[ch])
+            ids.append(v)
         return ids
 
     def decode_greedy_ctc(self, ids: List[int]) -> str:
-        out = []
-        prev = None
+        out: List[str] = []
+        prev: Optional[int] = None
         for i in ids:
             if i == self.blank:
                 prev = i
@@ -90,18 +95,59 @@ class Vocab:
 
 
 def build_vocab(include_punct: bool = True, include_space: bool = True) -> Vocab:
-    chars = hiragana_charset(include_punct=include_punct,
-                             include_space=include_space)
+    chars = hiragana_charset(include_punct=include_punct, include_space=include_space)
+    stoi = {c: i + 1 for i, c in enumerate(chars)}  # 1.., 0 is blank
+    return Vocab(itos=chars, stoi=stoi)
+
+
+def build_vocab_from_dataset_chars(
+    char_freq: Counter,
+    include_punct: bool,
+    include_space: bool,
+    min_char_freq: int = 1,
+    max_vocab_chars: int = 0,
+) -> Vocab:
+    """
+    Build vocab from dataset label characters (supports kanji).
+    Deterministic ordering:
+      - sort by freq desc, then codepoint asc
+    """
+    min_char_freq = int(min_char_freq)
+    if min_char_freq < 1:
+        min_char_freq = 1
+
+    items = [(ch, n) for ch, n in char_freq.items() if n >= min_char_freq]
+
+    # optionally force punct/space availability
+    if include_punct:
+        for ch in ["ー", "、", "。"]:
+            if ch not in char_freq:
+                items.append((ch, min_char_freq))
+    if include_space:
+        if " " not in char_freq:
+            items.append((" ", min_char_freq))
+
+    # de-dup then sort deterministically
+    tmp: Dict[str, int] = {}
+    for ch, n in items:
+        tmp[ch] = max(tmp.get(ch, 0), int(n))
+    items2 = list(tmp.items())
+    items2.sort(key=lambda x: (-x[1], ord(x[0])))
+
+    if max_vocab_chars and int(max_vocab_chars) > 0:
+        items2 = items2[: int(max_vocab_chars)]
+
+    chars = [ch for ch, _ in items2]
     stoi = {c: i + 1 for i, c in enumerate(chars)}  # 1.., 0 is blank
     return Vocab(itos=chars, stoi=stoi)
 
 
 # ---------------- Dataset ----------------
 
+
 def estimate_valid_width_from_image_L(img_L: Image.Image, ink_thresh: int = 245) -> int:
     """
-    Estimate the rightmost ink column (white bg, black ink).
-    Returns valid width in pixels (>=1).
+    Estimate rightmost ink column (white bg, black ink). Returns valid width in pixels (>=1).
     ink_thresh: pixels < ink_thresh treated as ink.
     """
     a = np.array(img_L, dtype=np.uint8)  # 0..255
@@ -125,13 +171,13 @@ def _resolve_labels_path(root: Path, labels: Path) -> Path:
     cand = root / labels
     if cand.is_file():
         return cand
-    return labels  # will be validated later
+    return labels  # validated later
 
 
 def pad_min_width_L(img_L: Image.Image, min_w: int) -> Image.Image:
     """
     Pad image (L) to at least min_w with white background on the right.
-    Keeps content unchanged; valid_w should still be computed from ink.
+    Keeps content unchanged; valid_w should still be computed from ink (before padding).
     """
     min_w = int(min_w)
     if min_w <= 0:
@@ -152,10 +198,13 @@ class MultiJsonlHandwritingDataset(Dataset):
       - "text": label string
     """
 
-    def __init__(self, datasets: List[Tuple[Path, Path]], ink_thresh: int = 245, min_w: int = 0):
+    def __init__(
+        self, datasets: List[Tuple[Path, Path]], ink_thresh: int = 245, min_w: int = 0
+    ):
         self.ink_thresh = int(ink_thresh)
         self.min_w = int(min_w)
         self.items: List[Tuple[Path, Path, str]] = []  # (root, rel_path, text)
+        self.char_freq: Counter[str] = Counter()
 
         if not datasets:
             raise RuntimeError("No datasets provided.")
@@ -182,7 +231,10 @@ class MultiJsonlHandwritingDataset(Dataset):
                         )
                     rel = Path(obj["path"])
                     text = str(obj["text"])
+
                     self.items.append((root, rel, text))
+                    for ch in text:
+                        self.char_freq[ch] += 1
 
         if not self.items:
             raise RuntimeError("No samples found across all provided datasets.")
@@ -219,10 +271,10 @@ def split_indices(n: int, val_ratio: float, seed: int) -> Tuple[List[int], List[
 
 def collate_ctc(batch, vocab: Vocab):
     # batch: list of (x[1,H,W], valid_w, text)
-    xs = []
-    valid_widths = []
-    targets = []
-    target_lens = []
+    xs: List[torch.Tensor] = []
+    valid_widths: List[int] = []
+    targets: List[int] = []
+    target_lens: List[int] = []
 
     for x, valid_w, text in batch:
         xs.append(x)
@@ -247,18 +299,23 @@ def collate_ctc(batch, vocab: Vocab):
 
 # ---------------- Model (CRNN) ----------------
 
+
 class ConvFeature(nn.Module):
     def __init__(self):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(1, 32, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(1, 32, 3, padding=1),
+            nn.ReLU(),
             nn.MaxPool2d((2, 2)),  # H:32->16, W:/2
-            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
-            # CHANGED: was (2,2) -> (2,1) to keep W (so total W downsample becomes /2 instead of /4)
-            nn.MaxPool2d((2, 1)),  # H:16->8, W:keep (=> total W//2)
-            nn.Conv2d(64, 128, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.ReLU(),
+            # keep W (so total W downsample becomes /2 instead of /4)
+            nn.MaxPool2d((2, 1)),  # H:16->8, W:keep
+            nn.Conv2d(64, 128, 3, padding=1),
+            nn.ReLU(),
             nn.MaxPool2d((2, 1)),  # H:8->4, W keep
-            nn.Conv2d(128, 128, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(128, 128, 3, padding=1),
+            nn.ReLU(),
             nn.MaxPool2d((4, 1)),  # H:4->1, W keep
         )
 
@@ -280,27 +337,27 @@ class CRNNCTC(nn.Module):
         self.fc = nn.Linear(rnn_hidden * 2, vocab_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        f = self.feat(x)              # [B,128,1,W']
-        f = f.squeeze(2)              # [B,128,W']
-        f = f.permute(2, 0, 1)        # [T,B,128]
-        y, _ = self.rnn(f)            # [T,B,2H]
-        logits = self.fc(y)           # [T,B,V]
+        f = self.feat(x)  # [B,128,1,W']
+        f = f.squeeze(2)  # [B,128,W']
+        f = f.permute(2, 0, 1)  # [T,B,128]
+        y, _ = self.rnn(f)  # [T,B,2H]
+        logits = self.fc(y)  # [T,B,V]
         return F.log_softmax(logits, dim=-1)
 
 
 def width_to_time_steps(valid_widths: torch.Tensor) -> torch.Tensor:
-    # CHANGED: CNN downsamples width by ~2 now (was ~4)
+    # CNN downsamples width by ~2
     return torch.clamp(valid_widths // 2, min=1)
 
 
 # ---------------- Diagnostics ----------------
+
 
 def _is_finite_tensor(t: torch.Tensor) -> bool:
     return bool(torch.isfinite(t).all().item())
 
 
 def _grad_norm(model: nn.Module, norm_type: float = 2.0) -> float:
-    # Similar to torch.nn.utils.clip_grad_norm_ but without clipping
     parameters = [p for p in model.parameters() if p.grad is not None]
     if not parameters:
         return 0.0
@@ -308,12 +365,11 @@ def _grad_norm(model: nn.Module, norm_type: float = 2.0) -> float:
     total = torch.zeros((), device=device)
     for p in parameters:
         param_norm = p.grad.data.norm(norm_type)
-        total = total + (param_norm ** norm_type)
+        total = total + (param_norm**norm_type)
     return float(total.pow(1.0 / norm_type).item())
 
 
 def _levenshtein(a: str, b: str) -> int:
-    # small strings, DP ok
     if a == b:
         return 0
     if len(a) == 0:
@@ -332,14 +388,15 @@ def _levenshtein(a: str, b: str) -> int:
     return prev[-1]
 
 
-def _ctc_greedy_decode_batch(log_probs: torch.Tensor, input_lens: torch.Tensor, vocab: Vocab) -> List[str]:
+def _ctc_greedy_decode_batch(
+    log_probs: torch.Tensor, input_lens: torch.Tensor, vocab: Vocab
+) -> List[str]:
     # log_probs: [T,B,V]
     # input_lens: [B] (<=T)
-    # returns decoded strings length B
     with torch.no_grad():
         pred_ids = torch.argmax(log_probs, dim=-1)  # [T,B]
         T, B = pred_ids.shape
-        out = []
+        out: List[str] = []
         for b in range(B):
             tlen = int(input_lens[b].item())
             tlen = max(1, min(tlen, T))
@@ -349,6 +406,7 @@ def _ctc_greedy_decode_batch(log_probs: torch.Tensor, input_lens: torch.Tensor, 
 
 
 # ---------------- Progress helpers ----------------
+
 
 def _fmt_time(sec: float) -> str:
     sec = max(0.0, float(sec))
@@ -421,9 +479,9 @@ class EpochProgress:
 
 # ---------------- Train ----------------
 
+
 @dataclass
 class TrainConfig:
-    # if datasets is empty, fall back to data_dir/labels
     datasets: List[Tuple[Path, Path]]
     data_dir: Path
     labels: Path
@@ -440,30 +498,32 @@ class TrainConfig:
     include_punct: bool = True
     include_space: bool = True
 
+    # vocab control
+    vocab_mode: str = "hiragana"  # "hiragana" or "from_datasets"
+    min_char_freq: int = 1  # only for from_datasets
+    max_vocab_chars: int = 0  # 0 = unlimited (only for from_datasets)
+
     rnn_hidden: int = 192
     rnn_layers: int = 2
 
-    ink_thresh: int = 245  # valid width detection
-    min_w: int = 96        # NEW: minimum width padding (0 disables)
+    ink_thresh: int = 245
+    min_w: int = 96
 
     # progress
     log_every: int = 50
     progress_seconds: float = 2.0
 
     # diagnostics
-    diag_every: int = 200          # detailed diag log every N train steps
-    preview_every: int = 1         # show val previews every N epochs
-    preview_samples: int = 8       # number of preview samples
-    strict_nan: bool = False       # if True, abort on NaN/Inf
-    max_bad_ctc_ratio: float = 0.30  # warn if input_lens < target_lens exceeds this ratio
+    diag_every: int = 200
+    preview_every: int = 1
+    preview_samples: int = 8
+    strict_nan: bool = False
+    max_bad_ctc_ratio: float = 0.30
 
 
 def parse_dataset_spec(s: str) -> Tuple[Path, Path]:
     """
     --dataset ROOT:LABELS_JSONL (repeatable)
-    Example:
-      --dataset dataset_hira:dataset_hira/labels.jsonl
-      --dataset dataset_tomoe_hira:dataset_tomoe_hira/labels.jsonl
     """
     if ":" not in s:
         raise argparse.ArgumentTypeError(
@@ -473,10 +533,8 @@ def parse_dataset_spec(s: str) -> Tuple[Path, Path]:
     root = Path(root_s)
     labels = Path(labels_s)
 
-    # If labels doesn't exist as given, try root/labels
     labels2 = _resolve_labels_path(root, labels)
 
-    # Validate early for better UX
     if not root.is_dir():
         raise argparse.ArgumentTypeError(f"dataset root dir not found: {root}")
     if not labels2.is_file():
@@ -485,28 +543,56 @@ def parse_dataset_spec(s: str) -> Tuple[Path, Path]:
     return root, labels2
 
 
-def _print_once_header(cfg: TrainConfig, vocab: Vocab, train_n: int, val_n: int) -> None:
+def _print_once_header(
+    cfg: TrainConfig, vocab: Vocab, train_n: int, val_n: int
+) -> None:
     print("========== CONFIG ==========")
-    print(f"device={cfg.device} seed={cfg.seed} epochs={cfg.epochs} batch_size={cfg.batch_size} lr={cfg.lr}")
-    print(f"vocab_size={vocab.size} (blank=0, chars={len(vocab.itos)}) include_punct={cfg.include_punct} include_space={cfg.include_space}")
-    print(f"datasets={len(cfg.datasets)} train_samples={train_n} val_samples={val_n} val_ratio={cfg.val_ratio}")
-    print(f"ink_thresh={cfg.ink_thresh} min_w={cfg.min_w} num_workers={cfg.num_workers}")
-    print(f"diag_every={cfg.diag_every} preview_every={cfg.preview_every} preview_samples={cfg.preview_samples} strict_nan={cfg.strict_nan}")
+    print(
+        f"device={cfg.device} seed={cfg.seed} epochs={cfg.epochs} batch_size={cfg.batch_size} lr={cfg.lr}"
+    )
+    print(
+        f"vocab_mode={cfg.vocab_mode} vocab_size={vocab.size} (blank=0, chars={len(vocab.itos)})"
+    )
+    print(
+        f"include_punct={cfg.include_punct} include_space={cfg.include_space} min_char_freq={cfg.min_char_freq} max_vocab_chars={cfg.max_vocab_chars}"
+    )
+    print(
+        f"datasets={len(cfg.datasets)} train_samples={train_n} val_samples={val_n} val_ratio={cfg.val_ratio}"
+    )
+    print(
+        f"ink_thresh={cfg.ink_thresh} min_w={cfg.min_w} num_workers={cfg.num_workers}"
+    )
+    print(
+        f"diag_every={cfg.diag_every} preview_every={cfg.preview_every} preview_samples={cfg.preview_samples} strict_nan={cfg.strict_nan}"
+    )
     print("============================", flush=True)
 
 
 def main():
     ap = argparse.ArgumentParser()
 
-    # Backward compatible single-dataset args (still usable)
-    ap.add_argument("--data_dir", type=str, default="dataset_hira",
-                    help="(legacy) Single dataset root dir. If --dataset is provided, this is ignored.")
-    ap.add_argument("--labels", type=str, default="dataset_hira/labels.jsonl",
-                    help="(legacy) Single labels jsonl. If --dataset is provided, this is ignored.")
+    # legacy single-dataset args
+    ap.add_argument(
+        "--data_dir",
+        type=str,
+        default="dataset_hira",
+        help="(legacy) Single dataset root dir. If --dataset is provided, ignored.",
+    )
+    ap.add_argument(
+        "--labels",
+        type=str,
+        default="dataset_hira/labels.jsonl",
+        help="(legacy) Single labels jsonl. If --dataset is provided, ignored.",
+    )
 
-    # New multi-dataset arg
-    ap.add_argument("--dataset", type=parse_dataset_spec, action="append", default=[],
-                    help="Repeatable dataset spec: ROOT:LABELS_JSONL. If provided, overrides --data_dir/--labels.")
+    # multi-dataset
+    ap.add_argument(
+        "--dataset",
+        type=parse_dataset_spec,
+        action="append",
+        default=[],
+        help="Repeatable dataset spec: ROOT:LABELS_JSONL",
+    )
 
     ap.add_argument("--out_dir", type=str, default="runs/hira_ctc")
     ap.add_argument("--epochs", type=int, default=10)
@@ -520,40 +606,93 @@ def main():
     ap.add_argument("--no_punct", action="store_true")
     ap.add_argument("--no_space", action="store_true")
 
+    # vocab control
+    ap.add_argument(
+        "--vocab_mode",
+        type=str,
+        default="hiragana",
+        choices=["hiragana", "from_datasets"],
+        help="hiragana: fixed hiragana vocab. from_datasets: build vocab from labels (supports kanji).",
+    )
+    ap.add_argument(
+        "--min_char_freq",
+        type=int,
+        default=1,
+        help="(from_datasets) keep chars whose frequency >= this.",
+    )
+    ap.add_argument(
+        "--max_vocab_chars",
+        type=int,
+        default=0,
+        help="(from_datasets) cap vocab size (0 = unlimited). Highest-frequency chars kept.",
+    )
+
     ap.add_argument("--rnn_hidden", type=int, default=192)
     ap.add_argument("--rnn_layers", type=int, default=2)
 
-    ap.add_argument("--ink_thresh", type=int, default=245,
-                    help="ink threshold for valid width detection (pixels < thresh treated as ink)")
+    ap.add_argument(
+        "--ink_thresh",
+        type=int,
+        default=245,
+        help="ink threshold for valid width detection (pixels < thresh treated as ink)",
+    )
+    ap.add_argument(
+        "--min_w",
+        type=int,
+        default=96,
+        help="Pad images to at least this width (white) to avoid tiny widths. 0 disables.",
+    )
 
-    # NEW: minimum width padding (training-time)
-    ap.add_argument("--min_w", type=int, default=96,
-                    help="Pad images to at least this width (white) to avoid tiny widths. 0 disables.")
+    # progress
+    ap.add_argument(
+        "--log_every",
+        type=int,
+        default=50,
+        help="Print progress every N training steps (plus time-based printing).",
+    )
+    ap.add_argument(
+        "--progress_seconds",
+        type=float,
+        default=2.0,
+        help="Print progress at least every N seconds.",
+    )
 
-    # progress args
-    ap.add_argument("--log_every", type=int, default=50,
-                    help="Print progress every N training steps (in addition to time-based printing).")
-    ap.add_argument("--progress_seconds", type=float, default=2.0,
-                    help="Print progress at least every N seconds.")
-
-    # diagnostics args
-    ap.add_argument("--diag_every", type=int, default=200,
-                    help="Print detailed diagnostics every N training steps.")
-    ap.add_argument("--preview_every", type=int, default=1,
-                    help="Print validation prediction previews every N epochs.")
-    ap.add_argument("--preview_samples", type=int, default=8,
-                    help="Number of samples to preview from validation set.")
-    ap.add_argument("--strict_nan", action="store_true",
-                    help="Abort training if NaN/Inf is detected in loss/log_probs.")
-    ap.add_argument("--max_bad_ctc_ratio", type=float, default=0.30,
-                    help="Warn if fraction of samples with input_lens < target_lens exceeds this threshold.")
+    # diagnostics
+    ap.add_argument(
+        "--diag_every",
+        type=int,
+        default=200,
+        help="Print detailed diagnostics every N training steps.",
+    )
+    ap.add_argument(
+        "--preview_every",
+        type=int,
+        default=1,
+        help="Print validation prediction previews every N epochs.",
+    )
+    ap.add_argument(
+        "--preview_samples",
+        type=int,
+        default=8,
+        help="Number of samples to preview from validation set.",
+    )
+    ap.add_argument(
+        "--strict_nan",
+        action="store_true",
+        help="Abort training if NaN/Inf is detected in loss/log_probs.",
+    )
+    ap.add_argument(
+        "--max_bad_ctc_ratio",
+        type=float,
+        default=0.30,
+        help="Warn if fraction of samples with input_lens < target_lens exceeds this threshold.",
+    )
 
     args = ap.parse_args()
 
-    # datasets: if --dataset is provided, use it; else fallback to legacy
-    datasets: List[Tuple[Path, Path]] = []
+    # datasets
     if args.dataset:
-        datasets = list(args.dataset)
+        datasets: List[Tuple[Path, Path]] = list(args.dataset)
     else:
         root = Path(args.data_dir)
         labels = _resolve_labels_path(root, Path(args.labels))
@@ -569,10 +708,15 @@ def main():
         lr=float(args.lr),
         seed=int(args.seed),
         num_workers=int(args.num_workers),
-        device=("cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu"),
+        device=(
+            "cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu"
+        ),
         val_ratio=float(args.val_ratio),
         include_punct=(not args.no_punct),
         include_space=(not args.no_space),
+        vocab_mode=str(args.vocab_mode),
+        min_char_freq=int(args.min_char_freq),
+        max_vocab_chars=int(args.max_vocab_chars),
         rnn_hidden=int(args.rnn_hidden),
         rnn_layers=int(args.rnn_layers),
         ink_thresh=int(args.ink_thresh),
@@ -591,23 +735,50 @@ def main():
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
 
-    vocab = build_vocab(include_punct=cfg.include_punct,
-                        include_space=cfg.include_space)
+    # Build combined dataset (and collect char freq)
+    ds = MultiJsonlHandwritingDataset(
+        datasets=cfg.datasets, ink_thresh=cfg.ink_thresh, min_w=cfg.min_w
+    )
+
+    # Build vocab
+    if cfg.vocab_mode == "hiragana":
+        vocab = build_vocab(
+            include_punct=cfg.include_punct, include_space=cfg.include_space
+        )
+    else:
+        vocab = build_vocab_from_dataset_chars(
+            ds.char_freq,
+            include_punct=cfg.include_punct,
+            include_space=cfg.include_space,
+            min_char_freq=cfg.min_char_freq,
+            max_vocab_chars=cfg.max_vocab_chars,
+        )
+
+        # safety: ensure no unknown chars remain in dataset labels
+        vocab_set = set(vocab.itos)
+        missing = [ch for ch in ds.char_freq.keys() if ch not in vocab_set]
+        if missing:
+            # show only a small sample to avoid huge output
+            sample = missing[:50]
+            raise RuntimeError(
+                "Some label characters are not in vocab (likely due to min_char_freq/max_vocab_chars). "
+                f"Missing sample (up to 50): {sample}. "
+                "Fix by lowering --min_char_freq or increasing/removing --max_vocab_chars."
+            )
+
     vocab_path = cfg.out_dir / "vocab.json"
     with vocab_path.open("w", encoding="utf-8") as f:
         json.dump({"itos": vocab.itos}, f, ensure_ascii=False, indent=2)
 
-    # Build combined dataset
-    ds = MultiJsonlHandwritingDataset(
-        datasets=cfg.datasets, ink_thresh=cfg.ink_thresh, min_w=cfg.min_w)
+    # Split train/val
     train_idx, val_idx = split_indices(len(ds), cfg.val_ratio, cfg.seed)
-
-    # Create subset views without re-reading jsonl files
     train_items = [ds.items[i] for i in train_idx]
     val_items = [ds.items[i] for i in val_idx]
 
     class _Subset(Dataset):
-        def __init__(self, items: List[Tuple[Path, Path, str]], ink_thresh: int, min_w: int):
+        def __init__(
+            self, items: List[Tuple[Path, Path, str]], ink_thresh: int, min_w: int
+        ):
             self.items = items
             self.ink_thresh = int(ink_thresh)
             self.min_w = int(min_w)
@@ -618,12 +789,9 @@ def main():
         def __getitem__(self, idx: int):
             root, rel, text = self.items[idx]
             img = Image.open(root / rel).convert("L")
-
             valid_w = estimate_valid_width_from_image_L(img, ink_thresh=self.ink_thresh)
-
             if self.min_w > 0:
                 img = pad_min_width_L(img, self.min_w)
-
             arr = np.array(img, dtype=np.float32) / 255.0
             x = torch.from_numpy(arr).unsqueeze(0)
             return x, valid_w, text
@@ -631,21 +799,31 @@ def main():
     train_ds = _Subset(train_items, cfg.ink_thresh, cfg.min_w)
     val_ds = _Subset(val_items, cfg.ink_thresh, cfg.min_w)
 
-    def collate(b): return collate_ctc(b, vocab)
+    def collate(b):  # type: ignore
+        return collate_ctc(b, vocab)
 
     train_loader = DataLoader(
-        train_ds, batch_size=cfg.batch_size, shuffle=True,
-        num_workers=cfg.num_workers, collate_fn=collate, drop_last=False
+        train_ds,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        num_workers=cfg.num_workers,
+        collate_fn=collate,
+        drop_last=False,
     )
     val_loader = DataLoader(
-        val_ds, batch_size=cfg.batch_size, shuffle=False,
-        num_workers=cfg.num_workers, collate_fn=collate, drop_last=False
+        val_ds,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        collate_fn=collate,
+        drop_last=False,
     )
 
     _print_once_header(cfg, vocab, train_n=len(train_ds), val_n=len(val_ds))
 
-    model = CRNNCTC(vocab_size=vocab.size, rnn_hidden=cfg.rnn_hidden,
-                    rnn_layers=cfg.rnn_layers).to(cfg.device)
+    model = CRNNCTC(
+        vocab_size=vocab.size, rnn_hidden=cfg.rnn_hidden, rnn_layers=cfg.rnn_layers
+    ).to(cfg.device)
     opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     ctc_loss = nn.CTCLoss(blank=vocab.blank, zero_infinity=True)
 
@@ -653,19 +831,17 @@ def main():
     ckpt = cfg.out_dir / "model_state_dict.pt"
     ts_path = cfg.out_dir / "model_torchscript.pt"
 
-    pcfg = ProgressConfig(log_every=cfg.log_every,
-                          progress_seconds=cfg.progress_seconds)
-
-    # For stable preview selection across epochs
-    preview_indices = list(range(min(len(val_ds), max(1, cfg.preview_samples))))
-
+    pcfg = ProgressConfig(
+        log_every=cfg.log_every, progress_seconds=cfg.progress_seconds
+    )
     global_step = 0
 
     for epoch in range(1, cfg.epochs + 1):
         # ---- Train ----
         model.train()
-        tr = EpochProgress(total_steps=len(train_loader),
-                           total_samples=len(train_ds), pcfg=pcfg)
+        tr = EpochProgress(
+            total_steps=len(train_loader), total_samples=len(train_ds), pcfg=pcfg
+        )
 
         for xb, valid_widths, targets, target_lens in train_loader:
             global_step += 1
@@ -676,15 +852,17 @@ def main():
             log_probs = model(xb)  # [T,B,V]
             T = int(log_probs.shape[0])
 
-            # compute input lengths from valid widths (on CPU tensor) then clamp to T
             input_lens = width_to_time_steps(valid_widths).to(cfg.device)  # [B]
-            # clamp input_lens to T to satisfy CTCLoss requirement input_lens <= T
+
+            # clamp input_lens to T
             if (input_lens > T).any().item():
                 bad = int((input_lens > T).sum().item())
-                print(f"[epoch {epoch}] WARN: {bad} samples had input_lens > T (T={T}); clamping to T.", flush=True)
+                print(
+                    f"[epoch {epoch}] WARN: {bad} samples had input_lens > T (T={T}); clamping to T.",
+                    flush=True,
+                )
                 input_lens = torch.clamp(input_lens, max=T)
 
-            # diagnose input_lens vs target_lens
             bad_ctc = (input_lens < target_lens).sum().item()
             bad_ctc_ratio = float(bad_ctc) / max(1.0, float(xb.shape[0]))
 
@@ -692,43 +870,59 @@ def main():
 
             # NaN/Inf checks
             if not torch.isfinite(loss).item():
-                print(f"[epoch {epoch}] ERROR: loss is not finite: {float(loss.item())}", flush=True)
+                print(
+                    f"[epoch {epoch}] ERROR: loss is not finite: {float(loss.item())}",
+                    flush=True,
+                )
                 if cfg.strict_nan:
                     raise RuntimeError("Non-finite loss detected.")
-            if (global_step % cfg.diag_every == 0) and (not _is_finite_tensor(log_probs)):
+            if (global_step % cfg.diag_every == 0) and (
+                not _is_finite_tensor(log_probs)
+            ):
                 print(f"[epoch {epoch}] ERROR: log_probs contains NaN/Inf.", flush=True)
                 if cfg.strict_nan:
                     raise RuntimeError("Non-finite log_probs detected.")
 
             opt.zero_grad()
             loss.backward()
-
             gnorm = _grad_norm(model)
             opt.step()
 
-            tr.update(batch_size=int(xb.shape[0]),
-                      loss_value=float(loss.item()))
+            tr.update(batch_size=int(xb.shape[0]), loss_value=float(loss.item()))
 
             if tr.should_print():
                 print(tr.render(prefix=f"[epoch {epoch}] train:"), flush=True)
                 tr.mark_printed()
 
-            # Detailed diagnostics (shape/length sanity)
             if global_step % cfg.diag_every == 0:
                 vw = valid_widths.detach().cpu()
                 il = input_lens.detach().cpu()
                 tl = target_lens.detach().cpu()
 
-                msg = []
+                msg: List[str] = []
                 msg.append(f"[epoch {epoch}] DIAG step={global_step}")
-                msg.append(f"  xb.shape={tuple(xb.shape)}  log_probs.shape={tuple(log_probs.shape)}  T={T}")
-                msg.append(f"  valid_widths: min={int(vw.min())} mean={float(vw.float().mean()):.1f} max={int(vw.max())}")
-                msg.append(f"  input_lens:   min={int(il.min())} mean={float(il.float().mean()):.1f} max={int(il.max())} (clamped<=T)")
-                msg.append(f"  target_lens:  min={int(tl.min())} mean={float(tl.float().mean()):.2f} max={int(tl.max())}")
-                msg.append(f"  bad_ctc(input_lens<target_lens)={int(bad_ctc)}/{int(xb.shape[0])} ({bad_ctc_ratio*100:.1f}%)")
-                msg.append(f"  loss={float(loss.item()):.6f} grad_norm={gnorm:.3f} lr={opt.param_groups[0]['lr']:.6g}")
+                msg.append(
+                    f"  xb.shape={tuple(xb.shape)}  log_probs.shape={tuple(log_probs.shape)}  T={T}"
+                )
+                msg.append(
+                    f"  valid_widths: min={int(vw.min())} mean={float(vw.float().mean()):.1f} max={int(vw.max())}"
+                )
+                msg.append(
+                    f"  input_lens:   min={int(il.min())} mean={float(il.float().mean()):.1f} max={int(il.max())} (clamped<=T)"
+                )
+                msg.append(
+                    f"  target_lens:  min={int(tl.min())} mean={float(tl.float().mean()):.2f} max={int(tl.max())}"
+                )
+                msg.append(
+                    f"  bad_ctc(input_lens<target_lens)={int(bad_ctc)}/{int(xb.shape[0])} ({bad_ctc_ratio*100:.1f}%)"
+                )
+                msg.append(
+                    f"  loss={float(loss.item()):.6f} grad_norm={gnorm:.3f} lr={opt.param_groups[0]['lr']:.6g}"
+                )
                 if bad_ctc_ratio >= cfg.max_bad_ctc_ratio:
-                    msg.append("  WARN: bad_ctc_ratio is high. Consider increasing min_w, reducing downsample, or filtering tiny samples.")
+                    msg.append(
+                        "  WARN: bad_ctc_ratio is high. Consider increasing min_w, reducing downsample, or filtering tiny samples."
+                    )
                 if not torch.isfinite(loss).item():
                     msg.append("  WARN: loss is non-finite.")
                 print("\n".join(msg), flush=True)
@@ -737,18 +931,18 @@ def main():
 
         # ---- Val ----
         model.eval()
-        va = EpochProgress(total_steps=len(val_loader),
-                           total_samples=len(val_ds), pcfg=pcfg)
+        va = EpochProgress(
+            total_steps=len(val_loader), total_samples=len(val_ds), pcfg=pcfg
+        )
 
         total_edit = 0
         total_chars = 0
         total_exact = 0
         total_samples = 0
-
         preview_pairs: List[Tuple[str, str]] = []
 
         with torch.no_grad():
-            for bidx, (xb, valid_widths, targets, target_lens) in enumerate(val_loader):
+            for xb, valid_widths, targets, target_lens in val_loader:
                 xb = xb.to(cfg.device)
                 targets = targets.to(cfg.device)
                 target_lens = target_lens.to(cfg.device)
@@ -767,37 +961,34 @@ def main():
                     print(va.render(prefix=f"[epoch {epoch}]  val:"), flush=True)
                     va.mark_printed()
 
-                # metrics: greedy decode -> CER + exact match
                 preds = _ctc_greedy_decode_batch(log_probs, input_lens, vocab)
 
                 # rebuild target strings from flat targets/target_lens
-                # targets is 1D concatenated. Need to slice per sample.
                 tlist = targets.detach().cpu().tolist()
                 lens = target_lens.detach().cpu().tolist()
                 off = 0
                 for i, L in enumerate(lens):
-                    ids = tlist[off:off + L]
+                    ids = tlist[off : off + L]
                     off += L
-                    # ids are vocab indices (1..), 0 blank never appears in targets
                     tgt = "".join([vocab.itos[j - 1] for j in ids])
                     pred = preds[i]
 
                     d = _levenshtein(tgt, pred)
                     total_edit += d
                     total_chars += max(1, len(tgt))
-                    total_exact += (1 if tgt == pred else 0)
+                    total_exact += 1 if tgt == pred else 0
                     total_samples += 1
 
-                # collect previews from the first few batches
-                if (epoch % cfg.preview_every == 0) and (len(preview_pairs) < cfg.preview_samples):
-                    # take as many as needed from this batch
+                if (epoch % cfg.preview_every == 0) and (
+                    len(preview_pairs) < cfg.preview_samples
+                ):
                     tlist2 = targets.detach().cpu().tolist()
                     lens2 = target_lens.detach().cpu().tolist()
                     off2 = 0
                     for i, L in enumerate(lens2):
                         if len(preview_pairs) >= cfg.preview_samples:
                             break
-                        ids = tlist2[off2:off2 + L]
+                        ids = tlist2[off2 : off2 + L]
                         off2 += L
                         tgt = "".join([vocab.itos[j - 1] for j in ids])
                         preview_pairs.append((tgt, preds[i]))
@@ -808,34 +999,37 @@ def main():
 
         print(
             f"[epoch {epoch}] summary: train_loss={train_loss:.4f} val_loss={val_loss:.4f} val_CER={cer:.4f} val_exact={acc:.4f}",
-            flush=True
+            flush=True,
         )
 
         if (epoch % cfg.preview_every == 0) and preview_pairs:
             print(f"[epoch {epoch}] preview (val, greedy decode):", flush=True)
-            for i, (tgt, pred) in enumerate(preview_pairs[:cfg.preview_samples], start=1):
-                ok = ("OK" if tgt == pred else "NG")
+            for i, (tgt, pred) in enumerate(
+                preview_pairs[: cfg.preview_samples], start=1
+            ):
+                ok = "OK" if tgt == pred else "NG"
                 print(f"  {i:02d} {ok}  tgt='{tgt}'  pred='{pred}'", flush=True)
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save(model.state_dict(), ckpt)
-            print(f"[epoch {epoch}] best checkpoint saved -> {ckpt} (best_val_loss={best_val_loss:.6f})", flush=True)
+            print(
+                f"[epoch {epoch}] best checkpoint saved -> {ckpt} (best_val_loss={best_val_loss:.6f})",
+                flush=True,
+            )
 
     # TorchScript export
     state = torch.load(ckpt, map_location="cpu")
     model.load_state_dict(state)
-
-    model = model.to("cpu")          # ★これを必ず入れる
+    model = model.to("cpu")
     model.eval()
-
     scripted = torch.jit.script(model)
     scripted.save(str(ts_path))
 
-    print("Saved:")
-    print(" -", ckpt)
-    print(" -", ts_path)
-    print(" -", vocab_path)
+    print("Saved:", flush=True)
+    print(" -", ckpt, flush=True)
+    print(" -", ts_path, flush=True)
+    print(" -", vocab_path, flush=True)
 
 
 if __name__ == "__main__":
