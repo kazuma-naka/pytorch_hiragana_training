@@ -83,7 +83,7 @@ python3 train_hiragana_crnn_ctc.py --dataset dataset_hira:dataset_hira/labels.js
 
 ```bash
 
-python3 train_hiragana_crnn_ctc.py --dataset dataset_hira:dataset_hira/labels.jsonl --dataset dataset_tomoe_hira:dataset_tomoe_hira/labels.jsonl --dataset dataset_hira_font:dataset_hira_font/labels.jsonl --out_dir runs/hira_ctc_multi_fonts --epochs 200 --batch_size 64 --lr 5e-4 --device cuda --min_w 96 --diag_every 100 --log_every 20 --preview_every 1 --preview_samples 12
+python3 train_hiragana_crnn_ctc.py --dataset dataset_hira:dataset_hira/labels.jsonl --dataset dataset_tomoe_hira:dataset_tomoe_hira/labels.jsonl --out_dir runs/android-tomoe-out --epochs 200 --batch_size 64 --lr 5e-4 --device cuda --min_w 96 --diag_every 100 --log_every 20 --preview_every 1 --preview_samples 12
 
 ```
 
