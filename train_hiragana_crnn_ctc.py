@@ -1,6 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # train_hiragana_crnn_ctc.py
+#
+# Changes (accuracy-focused for 1-char CTC):
+# 1) Increase time steps by reducing width downsample: W//4 -> W//2
+#    - ConvFeature: 2nd pool changed (2,2) -> (2,1)
+#    - width_to_time_steps changed //4 -> //2
+# 2) Optional: min width padding at training time to avoid extremely tiny widths
+#    - --min_w (default 96). Set 0 to disable.
+#
+# Usage example:
+# python3 train_hiragana_crnn_ctc.py --dataset dataset_hira:dataset_hira/labels.jsonl --dataset dataset_tomoe_hira:dataset_tomoe_hira/labels.jsonl --out_dir runs/hira_ctc_multi --epochs 256 --batch_size 64 --lr 5e-4 --device cuda --min_w 96
 
 from __future__ import annotations
 
@@ -113,6 +123,22 @@ def _resolve_labels_path(root: Path, labels: Path) -> Path:
     return labels  # will be validated later
 
 
+def pad_min_width_L(img_L: Image.Image, min_w: int) -> Image.Image:
+    """
+    Pad image (L) to at least min_w with white background on the right.
+    Keeps content unchanged; valid_w should still be computed from ink.
+    """
+    min_w = int(min_w)
+    if min_w <= 0:
+        return img_L
+    w, h = img_L.size
+    if w >= min_w:
+        return img_L
+    out = Image.new("L", (min_w, h), 255)
+    out.paste(img_L, (0, 0))
+    return out
+
+
 class MultiJsonlHandwritingDataset(Dataset):
     """
     Combine multiple datasets: each dataset is (root_dir, labels_jsonl_path).
@@ -121,8 +147,9 @@ class MultiJsonlHandwritingDataset(Dataset):
       - "text": label string
     """
 
-    def __init__(self, datasets: List[Tuple[Path, Path]], ink_thresh: int = 245):
+    def __init__(self, datasets: List[Tuple[Path, Path]], ink_thresh: int = 245, min_w: int = 0):
         self.ink_thresh = int(ink_thresh)
+        self.min_w = int(min_w)
         self.items: List[Tuple[Path, Path, str]] = []  # (root, rel_path, text)
 
         if not datasets:
@@ -153,8 +180,7 @@ class MultiJsonlHandwritingDataset(Dataset):
                     self.items.append((root, rel, text))
 
         if not self.items:
-            raise RuntimeError(
-                "No samples found across all provided datasets.")
+            raise RuntimeError("No samples found across all provided datasets.")
 
     def __len__(self) -> int:
         return len(self.items)
@@ -164,8 +190,12 @@ class MultiJsonlHandwritingDataset(Dataset):
         img_path = root / rel
         img = Image.open(img_path).convert("L")  # white bg, black ink
 
-        valid_w = estimate_valid_width_from_image_L(
-            img, ink_thresh=self.ink_thresh)
+        # valid width from ink (before padding)
+        valid_w = estimate_valid_width_from_image_L(img, ink_thresh=self.ink_thresh)
+
+        # optional: pad to minimum width to avoid tiny W -> tiny T
+        if self.min_w > 0:
+            img = pad_min_width_L(img, self.min_w)
 
         arr = np.array(img, dtype=np.float32) / 255.0
         x = torch.from_numpy(arr).unsqueeze(0)  # [1,H,W]
@@ -196,7 +226,7 @@ def collate_ctc(batch, vocab: Vocab):
         targets.extend(ids)
         target_lens.append(len(ids))
 
-    max_w = max([x.shape[-1] for x in xs])  # typically 512
+    max_w = max([x.shape[-1] for x in xs])
     H = xs[0].shape[1]
 
     xb = torch.ones((len(xs), 1, H, max_w), dtype=torch.float32)  # white pad
@@ -219,7 +249,8 @@ class ConvFeature(nn.Module):
             nn.Conv2d(1, 32, 3, padding=1), nn.ReLU(),
             nn.MaxPool2d((2, 2)),  # H:32->16, W:/2
             nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(),
-            nn.MaxPool2d((2, 2)),  # H:16->8, W:/2 (=> W//4)
+            # CHANGED: was (2,2) -> (2,1) to keep W (so total W downsample becomes /2 instead of /4)
+            nn.MaxPool2d((2, 1)),  # H:16->8, W:keep (=> total W//2)
             nn.Conv2d(64, 128, 3, padding=1), nn.ReLU(),
             nn.MaxPool2d((2, 1)),  # H:8->4, W keep
             nn.Conv2d(128, 128, 3, padding=1), nn.ReLU(),
@@ -253,8 +284,8 @@ class CRNNCTC(nn.Module):
 
 
 def width_to_time_steps(valid_widths: torch.Tensor) -> torch.Tensor:
-    # CNN downsamples width by ~4
-    return torch.clamp(valid_widths // 4, min=1)
+    # CHANGED: CNN downsamples width by ~2 now (was ~4)
+    return torch.clamp(valid_widths // 2, min=1)
 
 
 # ---------------- Progress helpers ----------------
@@ -353,6 +384,7 @@ class TrainConfig:
     rnn_layers: int = 2
 
     ink_thresh: int = 245  # valid width detection
+    min_w: int = 96        # NEW: minimum width padding (0 disables)
 
     # progress
     log_every: int = 50
@@ -418,6 +450,10 @@ def main():
     ap.add_argument("--ink_thresh", type=int, default=245,
                     help="ink threshold for valid width detection (pixels < thresh treated as ink)")
 
+    # NEW: minimum width padding (training-time)
+    ap.add_argument("--min_w", type=int, default=96,
+                    help="Pad images to at least this width (white) to avoid tiny widths. 0 disables.")
+
     # progress args
     ap.add_argument("--log_every", type=int, default=50,
                     help="Print progress every N training steps (in addition to time-based printing).")
@@ -445,14 +481,14 @@ def main():
         lr=float(args.lr),
         seed=int(args.seed),
         num_workers=int(args.num_workers),
-        device=("cuda" if args.device ==
-                "cuda" and torch.cuda.is_available() else "cpu"),
+        device=("cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu"),
         val_ratio=float(args.val_ratio),
         include_punct=(not args.no_punct),
         include_space=(not args.no_space),
         rnn_hidden=int(args.rnn_hidden),
         rnn_layers=int(args.rnn_layers),
         ink_thresh=int(args.ink_thresh),
+        min_w=int(args.min_w),
         log_every=int(args.log_every),
         progress_seconds=float(args.progress_seconds),
     )
@@ -470,7 +506,7 @@ def main():
 
     # Build combined dataset
     ds = MultiJsonlHandwritingDataset(
-        datasets=cfg.datasets, ink_thresh=cfg.ink_thresh)
+        datasets=cfg.datasets, ink_thresh=cfg.ink_thresh, min_w=cfg.min_w)
     train_idx, val_idx = split_indices(len(ds), cfg.val_ratio, cfg.seed)
 
     # Create subset views without re-reading jsonl files
@@ -478,9 +514,10 @@ def main():
     val_items = [ds.items[i] for i in val_idx]
 
     class _Subset(Dataset):
-        def __init__(self, items: List[Tuple[Path, Path, str]], ink_thresh: int):
+        def __init__(self, items: List[Tuple[Path, Path, str]], ink_thresh: int, min_w: int):
             self.items = items
             self.ink_thresh = int(ink_thresh)
+            self.min_w = int(min_w)
 
         def __len__(self):
             return len(self.items)
@@ -488,14 +525,18 @@ def main():
         def __getitem__(self, idx: int):
             root, rel, text = self.items[idx]
             img = Image.open(root / rel).convert("L")
-            valid_w = estimate_valid_width_from_image_L(
-                img, ink_thresh=self.ink_thresh)
+
+            valid_w = estimate_valid_width_from_image_L(img, ink_thresh=self.ink_thresh)
+
+            if self.min_w > 0:
+                img = pad_min_width_L(img, self.min_w)
+
             arr = np.array(img, dtype=np.float32) / 255.0
             x = torch.from_numpy(arr).unsqueeze(0)
             return x, valid_w, text
 
-    train_ds = _Subset(train_items, cfg.ink_thresh)
-    val_ds = _Subset(val_items, cfg.ink_thresh)
+    train_ds = _Subset(train_items, cfg.ink_thresh, cfg.min_w)
+    val_ds = _Subset(val_items, cfg.ink_thresh, cfg.min_w)
 
     def collate(b): return collate_ctc(b, vocab)
 
@@ -532,8 +573,7 @@ def main():
             target_lens = target_lens.to(cfg.device)
 
             log_probs = model(xb)  # [T,B,V]
-            input_lens = width_to_time_steps(
-                valid_widths).to(cfg.device)  # [B]
+            input_lens = width_to_time_steps(valid_widths).to(cfg.device)  # [B]
 
             loss = ctc_loss(log_probs, targets, input_lens, target_lens)
 
@@ -564,24 +604,20 @@ def main():
                 input_lens = width_to_time_steps(valid_widths).to(cfg.device)
                 loss = ctc_loss(log_probs, targets, input_lens, target_lens)
 
-                va.update(batch_size=int(
-                    xb.shape[0]), loss_value=float(loss.item()))
+                va.update(batch_size=int(xb.shape[0]), loss_value=float(loss.item()))
 
                 if va.should_print():
-                    print(
-                        va.render(prefix=f"[epoch {epoch}]  val:"), flush=True)
+                    print(va.render(prefix=f"[epoch {epoch}]  val:"), flush=True)
                     va.mark_printed()
 
         val_loss = va.loss_sum / max(1, va.step)
 
-        print(
-            f"[epoch {epoch}] summary: train_loss={train_loss:.4f} val_loss={val_loss:.4f}", flush=True)
+        print(f"[epoch {epoch}] summary: train_loss={train_loss:.4f} val_loss={val_loss:.4f}", flush=True)
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save(model.state_dict(), ckpt)
-            print(
-                f"[epoch {epoch}] best checkpoint saved -> {ckpt}", flush=True)
+            print(f"[epoch {epoch}] best checkpoint saved -> {ckpt}", flush=True)
 
     # TorchScript export
     state = torch.load(ckpt, map_location="cpu")
