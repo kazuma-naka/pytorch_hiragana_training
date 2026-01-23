@@ -78,6 +78,20 @@ python3 collect_hiragana_tk.py --batch --tomoe --tomoe_tdic tomoe_data/all.tdic 
 python3 collect_hiragana_tk.py --auto_elastic_alpha 18 --auto_elastic_sigma 6 --auto_scale_min 0.5 --auto_scale_max 2 --auto_erode_prob 0 --auto_edge_blur 0 --auto_elastic_prob 0 --auto_pressure_prob 0 --auto_blur 0 --auto_interval_ms 1 --auto_repeat_per_token 2000 --auto_thicken_min 2 --auto_thicken_max 4 --auto_noise 0 --auto_font_ttf_list "$(printf '%s ' fonts/*.ttf fonts/*.otf 2>/dev/null)"
 ```
 
+```bash
+
+python3 collect_hiragana_tk.py --batch --tomoe --tomoe_tdic tomoe_data/hiragana_diacritics.tdic --tomoe_per_char 6000 --out_dir dataset_tomoe_hira --target_h 32 --max_w 512 --tomoe_pen_width_min 8 --tomoe_pen_width_max 16 --auto_scale_min 0.8 --auto_scale_max 1.2 --tomoe_point_jitter 0.6 --tomoe_drop_point_prob 0 --auto_pressure_prob 0 --auto_elastic_prob 0.1 --auto_elastic_alpha 6 --auto_elastic_sigma 3 --auto_erode_prob 0.3 --auto_edge_blur 0.2 --auto_blur 0.3 --auto_rotate_deg 6 --auto_noise 0.2 --tomoe_stroke_perturb_prob 0.8 --tomoe_trim_prob 0.35 --tomoe_trim_max_frac 0.18 --tomoe_extend_prob 0.25 --tomoe_extend_max_frac 0.12 --tomoe_curve_prob 0.50 --tomoe_curve_amp_px 2.2 --tomoe_curve_freq_min 0.8 --tomoe_curve_freq_max 2.0 --tomoe_perturb_resample_n 56
+
+```
+
+```bash
+
+python3 build_dataset_from_android_pictures.py --src_root exported/Pictures/hand_writting_save_img --out_dir dataset_hira_android --prefix label_ --target_h 32 --max_w 512 --ink_thresh 245 --pad 0 --blur 0.0 --aug_copies 30 --rot_deg 8 --scale_min 0.9 --scale_max 1.1 --translate_px 0 --seed 42
+
+python build_dataset_from_android_pictures.py --src_root exported/Pictures/hand_writting_save_img --out_dir dataset_hira_android --aug_copies 3 --rot_deg 8 --scale_min 0.9 --scale_max 1.1 --translate_px 0 --seed 42
+
+```
+
 #### 2) 学習（CRNN + CTC）
 
 ```bash
