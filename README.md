@@ -106,6 +106,13 @@ python3 train_hiragana_crnn_ctc.py --dataset dataset_hira:dataset_hira/labels.js
 
 python3 train_hiragana_crnn_ctc.py --dataset dataset_hira:dataset_hira/labels.jsonl --dataset dataset_tomoe_hira:dataset_tomoe_hira/labels.jsonl --out_dir runs/android-tomoe-out --epochs 200 --batch_size 64 --lr 5e-4 --device cuda --min_w 96 --diag_every 100 --log_every 20 --preview_every 1 --preview_samples 12
 
+
+python3 train_hiragana_crnn_ctc.py --dataset dataset_hira_android:dataset_hira_android/labels.jsonl --dataset dataset_tomoe_hira:dataset_tomoe_hira/labels.jsonl --out_dir runs/android-tomoe-out-6000 --epochs 32 --batch_size 64 --lr 1e-3 --device cuda --min_w 96 --diag_every 100 --log_every 20 --preview_every 1 --preview_samples 12
+
+
+python3 train_hiragana_crnn_ctc.py --two_stage --dataset_synth dataset_tomoe_hira:dataset_tomoe_hira/labels.jsonl --dataset_hand dataset_hira_android:dataset_hira_android/labels.jsonl --out_dir runs/hira_ctc_two_stage --batch_size 64 --device cuda --stage1_epochs 12 --stage1_lr 3e-4 --stage2_epochs 6 --stage2_lr 1e-4 --min_w 96 --save_best_by stage2 --log_every 50 --diag_every 200 --preview_every 1 --preview_samples 12
+
+
 ```
 
 学習のポイント：

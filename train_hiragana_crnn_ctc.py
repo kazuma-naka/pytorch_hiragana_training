@@ -10,11 +10,21 @@
 # - min_w padding: optional training-time padding to avoid tiny widths -> tiny time steps.
 # - Diagnostics: shape/time-step logs, NaN/Inf checks, grad norm, val CER/exact, previews.
 #
-# Example:
+# Two-stage training (NEW):
+# - Stage1: train on synthetic dataset(s)
+# - Stage2: fine-tune on your own handwriting dataset(s)
+# - Controlled via --two_stage and --dataset_synth/--dataset_hand
+#
+# Example (two-stage, 1-char labels):
 # python3 train_hiragana_crnn_ctc.py \
-#   --dataset dataset_tomoe_all_hira_digits_kanji:dataset_tomoe_all_hira_digits_kanji/labels.jsonl \
-#   --out_dir runs/hira_ctc_tomoe_kanji --epochs 200 --batch_size 32 --lr 1e-3 --device cuda \
-#   --min_w 96 --diag_every 100 --log_every 20 --preview_every 1 --preview_samples 12
+#   --two_stage \
+#   --dataset_synth dataset_synth:dataset_synth/labels.jsonl \
+#   --dataset_hand dataset_hand:dataset_hand/labels.jsonl \
+#   --out_dir runs/hira_ctc_two_stage --batch_size 64 --device cuda \
+#   --stage1_epochs 12 --stage1_lr 3e-4 \
+#   --stage2_epochs 6  --stage2_lr 1e-4 \
+#   --min_w 96 --diag_every 200 --log_every 50 --preview_every 1 --preview_samples 12 \
+#   --save_best_by stage2
 
 from __future__ import annotations
 
@@ -266,6 +276,10 @@ def split_indices(n: int, val_ratio: float, seed: int) -> Tuple[List[int], List[
     val_n = max(1, int(round(n * val_ratio)))
     val = idxs[:val_n]
     train = idxs[val_n:]
+    if not train:
+        # keep at least 1 train sample
+        train = val[1:]
+        val = val[:1]
     return train, val
 
 
@@ -295,6 +309,75 @@ def collate_ctc(batch, vocab: Vocab):
     target_lens_t = torch.tensor(target_lens, dtype=torch.long)
     valid_widths_t = torch.tensor(valid_widths, dtype=torch.long)
     return xb, valid_widths_t, targets_t, target_lens_t
+
+
+class _Subset(Dataset):
+    def __init__(
+        self, items: List[Tuple[Path, Path, str]], ink_thresh: int, min_w: int
+    ):
+        self.items = items
+        self.ink_thresh = int(ink_thresh)
+        self.min_w = int(min_w)
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, idx: int):
+        root, rel, text = self.items[idx]
+        img = Image.open(root / rel).convert("L")
+        valid_w = estimate_valid_width_from_image_L(img, ink_thresh=self.ink_thresh)
+        if self.min_w > 0:
+            img = pad_min_width_L(img, self.min_w)
+        arr = np.array(img, dtype=np.float32) / 255.0
+        x = torch.from_numpy(arr).unsqueeze(0)
+        return x, valid_w, text
+
+
+def build_loaders_from_items(
+    *,
+    items: List[Tuple[Path, Path, str]],
+    vocab: Vocab,
+    ink_thresh: int,
+    min_w: int,
+    val_ratio: float,
+    seed: int,
+    batch_size: int,
+    num_workers: int,
+) -> Tuple[DataLoader, DataLoader, int, int]:
+    """
+    Build train/val loaders from a single list of items.
+    Returns (train_loader, val_loader, train_n, val_n)
+    """
+    if not items:
+        raise RuntimeError("No items to build loaders.")
+
+    idx_train, idx_val = split_indices(len(items), val_ratio, seed)
+    train_items = [items[i] for i in idx_train]
+    val_items = [items[i] for i in idx_val]
+
+    train_ds = _Subset(train_items, ink_thresh, min_w)
+    val_ds = _Subset(val_items, ink_thresh, min_w)
+
+    def collate(b):  # type: ignore
+        return collate_ctc(b, vocab)
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        collate_fn=collate,
+        drop_last=False,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=collate,
+        drop_last=False,
+    )
+    return train_loader, val_loader, len(train_ds), len(val_ds)
 
 
 # ---------------- Model (CRNN) ----------------
@@ -482,11 +565,17 @@ class EpochProgress:
 
 @dataclass
 class TrainConfig:
+    # legacy single-stage datasets
     datasets: List[Tuple[Path, Path]]
     data_dir: Path
     labels: Path
 
-    out_dir: Path
+    # two-stage datasets
+    two_stage: bool = False
+    datasets_synth: List[Tuple[Path, Path]] = None  # type: ignore
+    datasets_hand: List[Tuple[Path, Path]] = None  # type: ignore
+
+    out_dir: Path = Path("runs/hira_ctc")
     epochs: int = 10
     batch_size: int = 32
     lr: float = 1e-3
@@ -520,14 +609,21 @@ class TrainConfig:
     strict_nan: bool = False
     max_bad_ctc_ratio: float = 0.30
 
+    # two-stage hyperparams
+    stage1_epochs: int = 12
+    stage1_lr: float = 3e-4
+    stage2_epochs: int = 6
+    stage2_lr: float = 1e-4
+    save_best_by: str = "stage2"  # "stage1" or "stage2"
+
 
 def parse_dataset_spec(s: str) -> Tuple[Path, Path]:
     """
-    --dataset ROOT:LABELS_JSONL (repeatable)
+    ROOT:LABELS_JSONL (repeatable)
     """
     if ":" not in s:
         raise argparse.ArgumentTypeError(
-            f"--dataset must be in 'ROOT:LABELS_JSONL' format, got: {s}"
+            f"dataset must be in 'ROOT:LABELS_JSONL' format, got: {s}"
         )
     root_s, labels_s = s.split(":", 1)
     root = Path(root_s)
@@ -543,29 +639,256 @@ def parse_dataset_spec(s: str) -> Tuple[Path, Path]:
     return root, labels2
 
 
-def _print_once_header(
-    cfg: TrainConfig, vocab: Vocab, train_n: int, val_n: int
-) -> None:
+def _print_once_header(cfg: TrainConfig, vocab: Vocab, header_extra: List[str]) -> None:
     print("========== CONFIG ==========")
     print(
-        f"device={cfg.device} seed={cfg.seed} epochs={cfg.epochs} batch_size={cfg.batch_size} lr={cfg.lr}"
+        f"device={cfg.device} seed={cfg.seed} batch_size={cfg.batch_size} num_workers={cfg.num_workers}"
     )
+    if cfg.two_stage:
+        print(
+            f"two_stage=True stage1(epochs={cfg.stage1_epochs}, lr={cfg.stage1_lr}) stage2(epochs={cfg.stage2_epochs}, lr={cfg.stage2_lr}) save_best_by={cfg.save_best_by}"
+        )
+    else:
+        print(f"two_stage=False epochs={cfg.epochs} lr={cfg.lr}")
+
     print(
         f"vocab_mode={cfg.vocab_mode} vocab_size={vocab.size} (blank=0, chars={len(vocab.itos)})"
     )
     print(
         f"include_punct={cfg.include_punct} include_space={cfg.include_space} min_char_freq={cfg.min_char_freq} max_vocab_chars={cfg.max_vocab_chars}"
     )
+    print(f"ink_thresh={cfg.ink_thresh} min_w={cfg.min_w} val_ratio={cfg.val_ratio}")
     print(
-        f"datasets={len(cfg.datasets)} train_samples={train_n} val_samples={val_n} val_ratio={cfg.val_ratio}"
+        f"diag_every={cfg.diag_every} preview_every={cfg.preview_every} preview_samples={cfg.preview_samples} strict_nan={cfg.strict_nan} max_bad_ctc_ratio={cfg.max_bad_ctc_ratio}"
     )
-    print(
-        f"ink_thresh={cfg.ink_thresh} min_w={cfg.min_w} num_workers={cfg.num_workers}"
-    )
-    print(
-        f"diag_every={cfg.diag_every} preview_every={cfg.preview_every} preview_samples={cfg.preview_samples} strict_nan={cfg.strict_nan}"
-    )
+    for line in header_extra:
+        print(line)
     print("============================", flush=True)
+
+
+def run_train_val(
+    *,
+    stage_name: str,
+    cfg: TrainConfig,
+    model: nn.Module,
+    opt: torch.optim.Optimizer,
+    ctc_loss: nn.CTCLoss,
+    vocab: Vocab,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    pcfg: ProgressConfig,
+    start_global_step: int,
+    best_val_loss: float,
+    ckpt_path: Path,
+    save_best: bool,
+) -> Tuple[int, float]:
+    """
+    Run training for cfg.{epochs or stageX_epochs} depending on stage_name.
+    Returns (global_step, best_val_loss)
+    """
+    global_step = int(start_global_step)
+
+    if stage_name == "stage1":
+        epochs = int(cfg.stage1_epochs)
+    elif stage_name == "stage2":
+        epochs = int(cfg.stage2_epochs)
+    else:
+        epochs = int(cfg.epochs)
+
+    for epoch in range(1, epochs + 1):
+        # ---- Train ----
+        model.train()
+        tr = EpochProgress(
+            total_steps=len(train_loader),
+            total_samples=max(1, len(getattr(train_loader, "dataset", []))),
+            pcfg=pcfg,
+        )
+
+        for xb, valid_widths, targets, target_lens in train_loader:
+            global_step += 1
+            xb = xb.to(cfg.device)
+            targets = targets.to(cfg.device)
+            target_lens = target_lens.to(cfg.device)
+
+            log_probs = model(xb)  # [T,B,V]
+            T = int(log_probs.shape[0])
+
+            input_lens = width_to_time_steps(valid_widths).to(cfg.device)  # [B]
+
+            # clamp input_lens to T
+            if (input_lens > T).any().item():
+                bad = int((input_lens > T).sum().item())
+                print(
+                    f"[{stage_name} epoch {epoch}] WARN: {bad} samples had input_lens > T (T={T}); clamping to T.",
+                    flush=True,
+                )
+                input_lens = torch.clamp(input_lens, max=T)
+
+            bad_ctc = (input_lens < target_lens).sum().item()
+            bad_ctc_ratio = float(bad_ctc) / max(1.0, float(xb.shape[0]))
+
+            loss = ctc_loss(log_probs, targets, input_lens, target_lens)
+
+            # NaN/Inf checks
+            if not torch.isfinite(loss).item():
+                print(
+                    f"[{stage_name} epoch {epoch}] ERROR: loss is not finite: {float(loss.item())}",
+                    flush=True,
+                )
+                if cfg.strict_nan:
+                    raise RuntimeError("Non-finite loss detected.")
+            if (global_step % cfg.diag_every == 0) and (
+                not _is_finite_tensor(log_probs)
+            ):
+                print(
+                    f"[{stage_name} epoch {epoch}] ERROR: log_probs contains NaN/Inf.",
+                    flush=True,
+                )
+                if cfg.strict_nan:
+                    raise RuntimeError("Non-finite log_probs detected.")
+
+            opt.zero_grad()
+            loss.backward()
+            gnorm = _grad_norm(model)
+            opt.step()
+
+            tr.update(batch_size=int(xb.shape[0]), loss_value=float(loss.item()))
+
+            if tr.should_print():
+                print(
+                    tr.render(prefix=f"[{stage_name} epoch {epoch}] train:"),
+                    flush=True,
+                )
+                tr.mark_printed()
+
+            if global_step % cfg.diag_every == 0:
+                vw = valid_widths.detach().cpu()
+                il = input_lens.detach().cpu()
+                tl = target_lens.detach().cpu()
+
+                msg: List[str] = []
+                msg.append(f"[{stage_name} epoch {epoch}] DIAG step={global_step}")
+                msg.append(
+                    f"  xb.shape={tuple(xb.shape)}  log_probs.shape={tuple(log_probs.shape)}  T={T}"
+                )
+                msg.append(
+                    f"  valid_widths: min={int(vw.min())} mean={float(vw.float().mean()):.1f} max={int(vw.max())}"
+                )
+                msg.append(
+                    f"  input_lens:   min={int(il.min())} mean={float(il.float().mean()):.1f} max={int(il.max())} (clamped<=T)"
+                )
+                msg.append(
+                    f"  target_lens:  min={int(tl.min())} mean={float(tl.float().mean()):.2f} max={int(tl.max())}"
+                )
+                msg.append(
+                    f"  bad_ctc(input_lens<target_lens)={int(bad_ctc)}/{int(xb.shape[0])} ({bad_ctc_ratio*100:.1f}%)"
+                )
+                msg.append(
+                    f"  loss={float(loss.item()):.6f} grad_norm={gnorm:.3f} lr={opt.param_groups[0]['lr']:.6g}"
+                )
+                if bad_ctc_ratio >= cfg.max_bad_ctc_ratio:
+                    msg.append(
+                        "  WARN: bad_ctc_ratio is high. Consider increasing min_w, reducing downsample, or filtering tiny samples."
+                    )
+                if not torch.isfinite(loss).item():
+                    msg.append("  WARN: loss is non-finite.")
+                print("\n".join(msg), flush=True)
+
+        train_loss = tr.loss_sum / max(1, tr.step)
+
+        # ---- Val ----
+        model.eval()
+        va = EpochProgress(
+            total_steps=len(val_loader),
+            total_samples=max(1, len(getattr(val_loader, "dataset", []))),
+            pcfg=pcfg,
+        )
+
+        total_edit = 0
+        total_chars = 0
+        total_exact = 0
+        total_samples = 0
+        preview_pairs: List[Tuple[str, str]] = []
+
+        with torch.no_grad():
+            for xb, valid_widths, targets, target_lens in val_loader:
+                xb = xb.to(cfg.device)
+                targets = targets.to(cfg.device)
+                target_lens = target_lens.to(cfg.device)
+
+                log_probs = model(xb)
+                T = int(log_probs.shape[0])
+
+                input_lens = width_to_time_steps(valid_widths).to(cfg.device)
+                if (input_lens > T).any().item():
+                    input_lens = torch.clamp(input_lens, max=T)
+
+                loss = ctc_loss(log_probs, targets, input_lens, target_lens)
+                va.update(batch_size=int(xb.shape[0]), loss_value=float(loss.item()))
+
+                if va.should_print():
+                    print(va.render(prefix=f"[{stage_name} epoch {epoch}]  val:"), flush=True)
+                    va.mark_printed()
+
+                preds = _ctc_greedy_decode_batch(log_probs, input_lens, vocab)
+
+                # rebuild target strings from flat targets/target_lens
+                tlist = targets.detach().cpu().tolist()
+                lens = target_lens.detach().cpu().tolist()
+                off = 0
+                for i, L in enumerate(lens):
+                    ids = tlist[off : off + L]
+                    off += L
+                    tgt = "".join([vocab.itos[j - 1] for j in ids])
+                    pred = preds[i]
+
+                    d = _levenshtein(tgt, pred)
+                    total_edit += d
+                    total_chars += max(1, len(tgt))
+                    total_exact += 1 if tgt == pred else 0
+                    total_samples += 1
+
+                if (epoch % cfg.preview_every == 0) and (
+                    len(preview_pairs) < cfg.preview_samples
+                ):
+                    tlist2 = targets.detach().cpu().tolist()
+                    lens2 = target_lens.detach().cpu().tolist()
+                    off2 = 0
+                    for i, L in enumerate(lens2):
+                        if len(preview_pairs) >= cfg.preview_samples:
+                            break
+                        ids = tlist2[off2 : off2 + L]
+                        off2 += L
+                        tgt = "".join([vocab.itos[j - 1] for j in ids])
+                        preview_pairs.append((tgt, preds[i]))
+
+        val_loss = va.loss_sum / max(1, va.step)
+        cer = float(total_edit) / max(1.0, float(total_chars))
+        acc = float(total_exact) / max(1.0, float(total_samples))
+
+        print(
+            f"[{stage_name} epoch {epoch}] summary: train_loss={train_loss:.4f} val_loss={val_loss:.4f} val_CER={cer:.4f} val_exact={acc:.4f}",
+            flush=True,
+        )
+
+        if (epoch % cfg.preview_every == 0) and preview_pairs:
+            print(f"[{stage_name} epoch {epoch}] preview (val, greedy decode):", flush=True)
+            for i, (tgt, pred) in enumerate(
+                preview_pairs[: cfg.preview_samples], start=1
+            ):
+                ok = "OK" if tgt == pred else "NG"
+                print(f"  {i:02d} {ok}  tgt='{tgt}'  pred='{pred}'", flush=True)
+
+        # Save best checkpoint for this stage if requested
+        if save_best and (val_loss < best_val_loss):
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), ckpt_path)
+            print(
+                f"[{stage_name} epoch {epoch}] best checkpoint saved -> {ckpt_path} (best_val_loss={best_val_loss:.6f})",
+                flush=True,
+            )
+
+    return global_step, best_val_loss
 
 
 def main():
@@ -585,13 +908,45 @@ def main():
         help="(legacy) Single labels jsonl. If --dataset is provided, ignored.",
     )
 
-    # multi-dataset
+    # multi-dataset (single-stage)
     ap.add_argument(
         "--dataset",
         type=parse_dataset_spec,
         action="append",
         default=[],
-        help="Repeatable dataset spec: ROOT:LABELS_JSONL",
+        help="(single-stage) Repeatable dataset spec: ROOT:LABELS_JSONL",
+    )
+
+    # two-stage switches (NEW)
+    ap.add_argument(
+        "--two_stage",
+        action="store_true",
+        help="Enable two-stage training: stage1(synth) -> stage2(handwriting).",
+    )
+    ap.add_argument(
+        "--dataset_synth",
+        type=parse_dataset_spec,
+        action="append",
+        default=[],
+        help="(two-stage) Synthetic dataset spec: ROOT:LABELS_JSONL (repeatable).",
+    )
+    ap.add_argument(
+        "--dataset_hand",
+        type=parse_dataset_spec,
+        action="append",
+        default=[],
+        help="(two-stage) Your handwriting dataset spec: ROOT:LABELS_JSONL (repeatable).",
+    )
+    ap.add_argument("--stage1_epochs", type=int, default=12)
+    ap.add_argument("--stage1_lr", type=float, default=3e-4)
+    ap.add_argument("--stage2_epochs", type=int, default=6)
+    ap.add_argument("--stage2_lr", type=float, default=1e-4)
+    ap.add_argument(
+        "--save_best_by",
+        type=str,
+        default="stage2",
+        choices=["stage1", "stage2"],
+        help="Which stage's validation loss determines the best checkpoint.",
     )
 
     ap.add_argument("--out_dir", type=str, default="runs/hira_ctc")
@@ -690,27 +1045,44 @@ def main():
 
     args = ap.parse_args()
 
+    # device resolve
+    device = "cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu"
+
     # datasets
-    if args.dataset:
-        datasets: List[Tuple[Path, Path]] = list(args.dataset)
+    two_stage = bool(args.two_stage)
+    datasets: List[Tuple[Path, Path]] = []
+    datasets_synth: List[Tuple[Path, Path]] = list(args.dataset_synth or [])
+    datasets_hand: List[Tuple[Path, Path]] = list(args.dataset_hand or [])
+
+    if two_stage:
+        if not datasets_synth:
+            raise RuntimeError("--two_stage is set but --dataset_synth is empty.")
+        if not datasets_hand:
+            raise RuntimeError("--two_stage is set but --dataset_hand is empty.")
+        # for vocab building we also need union across both
+        datasets = datasets_synth + datasets_hand
     else:
-        root = Path(args.data_dir)
-        labels = _resolve_labels_path(root, Path(args.labels))
-        datasets = [(root, labels)]
+        if args.dataset:
+            datasets = list(args.dataset)
+        else:
+            root = Path(args.data_dir)
+            labels = _resolve_labels_path(root, Path(args.labels))
+            datasets = [(root, labels)]
 
     cfg = TrainConfig(
         datasets=datasets,
         data_dir=Path(args.data_dir),
         labels=Path(args.labels),
+        two_stage=two_stage,
+        datasets_synth=datasets_synth if two_stage else [],
+        datasets_hand=datasets_hand if two_stage else [],
         out_dir=Path(args.out_dir),
         epochs=int(args.epochs),
         batch_size=int(args.batch_size),
         lr=float(args.lr),
         seed=int(args.seed),
         num_workers=int(args.num_workers),
-        device=(
-            "cuda" if args.device == "cuda" and torch.cuda.is_available() else "cpu"
-        ),
+        device=device,
         val_ratio=float(args.val_ratio),
         include_punct=(not args.no_punct),
         include_space=(not args.no_space),
@@ -728,6 +1100,11 @@ def main():
         preview_samples=int(args.preview_samples),
         strict_nan=bool(args.strict_nan),
         max_bad_ctc_ratio=float(args.max_bad_ctc_ratio),
+        stage1_epochs=int(args.stage1_epochs),
+        stage1_lr=float(args.stage1_lr),
+        stage2_epochs=int(args.stage2_epochs),
+        stage2_lr=float(args.stage2_lr),
+        save_best_by=str(args.save_best_by),
     )
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -735,8 +1112,8 @@ def main():
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
 
-    # Build combined dataset (and collect char freq)
-    ds = MultiJsonlHandwritingDataset(
+    # Build combined dataset (union across needed datasets; used for vocab and item list)
+    ds_all = MultiJsonlHandwritingDataset(
         datasets=cfg.datasets, ink_thresh=cfg.ink_thresh, min_w=cfg.min_w
     )
 
@@ -747,7 +1124,7 @@ def main():
         )
     else:
         vocab = build_vocab_from_dataset_chars(
-            ds.char_freq,
+            ds_all.char_freq,
             include_punct=cfg.include_punct,
             include_space=cfg.include_space,
             min_char_freq=cfg.min_char_freq,
@@ -756,9 +1133,8 @@ def main():
 
         # safety: ensure no unknown chars remain in dataset labels
         vocab_set = set(vocab.itos)
-        missing = [ch for ch in ds.char_freq.keys() if ch not in vocab_set]
+        missing = [ch for ch in ds_all.char_freq.keys() if ch not in vocab_set]
         if missing:
-            # show only a small sample to avoid huge output
             sample = missing[:50]
             raise RuntimeError(
                 "Some label characters are not in vocab (likely due to min_char_freq/max_vocab_chars). "
@@ -770,255 +1146,150 @@ def main():
     with vocab_path.open("w", encoding="utf-8") as f:
         json.dump({"itos": vocab.itos}, f, ensure_ascii=False, indent=2)
 
-    # Split train/val
-    train_idx, val_idx = split_indices(len(ds), cfg.val_ratio, cfg.seed)
-    train_items = [ds.items[i] for i in train_idx]
-    val_items = [ds.items[i] for i in val_idx]
-
-    class _Subset(Dataset):
-        def __init__(
-            self, items: List[Tuple[Path, Path, str]], ink_thresh: int, min_w: int
-        ):
-            self.items = items
-            self.ink_thresh = int(ink_thresh)
-            self.min_w = int(min_w)
-
-        def __len__(self):
-            return len(self.items)
-
-        def __getitem__(self, idx: int):
-            root, rel, text = self.items[idx]
-            img = Image.open(root / rel).convert("L")
-            valid_w = estimate_valid_width_from_image_L(img, ink_thresh=self.ink_thresh)
-            if self.min_w > 0:
-                img = pad_min_width_L(img, self.min_w)
-            arr = np.array(img, dtype=np.float32) / 255.0
-            x = torch.from_numpy(arr).unsqueeze(0)
-            return x, valid_w, text
-
-    train_ds = _Subset(train_items, cfg.ink_thresh, cfg.min_w)
-    val_ds = _Subset(val_items, cfg.ink_thresh, cfg.min_w)
-
-    def collate(b):  # type: ignore
-        return collate_ctc(b, vocab)
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=cfg.num_workers,
-        collate_fn=collate,
-        drop_last=False,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=cfg.batch_size,
-        shuffle=False,
-        num_workers=cfg.num_workers,
-        collate_fn=collate,
-        drop_last=False,
-    )
-
-    _print_once_header(cfg, vocab, train_n=len(train_ds), val_n=len(val_ds))
-
+    # Build model/optimizer/loss
     model = CRNNCTC(
         vocab_size=vocab.size, rnn_hidden=cfg.rnn_hidden, rnn_layers=cfg.rnn_layers
     ).to(cfg.device)
-    opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     ctc_loss = nn.CTCLoss(blank=vocab.blank, zero_infinity=True)
 
-    best_val_loss = float("inf")
     ckpt = cfg.out_dir / "model_state_dict.pt"
     ts_path = cfg.out_dir / "model_torchscript.pt"
 
     pcfg = ProgressConfig(
         log_every=cfg.log_every, progress_seconds=cfg.progress_seconds
     )
-    global_step = 0
 
-    for epoch in range(1, cfg.epochs + 1):
-        # ---- Train ----
-        model.train()
-        tr = EpochProgress(
-            total_steps=len(train_loader), total_samples=len(train_ds), pcfg=pcfg
+    header_extra: List[str] = []
+    header_extra.append(f"out_dir={cfg.out_dir}")
+
+    # Two-stage: build synth/hand loaders separately
+    if cfg.two_stage:
+        ds_synth = MultiJsonlHandwritingDataset(
+            datasets=cfg.datasets_synth, ink_thresh=cfg.ink_thresh, min_w=cfg.min_w
+        )
+        ds_hand = MultiJsonlHandwritingDataset(
+            datasets=cfg.datasets_hand, ink_thresh=cfg.ink_thresh, min_w=cfg.min_w
         )
 
-        for xb, valid_widths, targets, target_lens in train_loader:
-            global_step += 1
-            xb = xb.to(cfg.device)
-            targets = targets.to(cfg.device)
-            target_lens = target_lens.to(cfg.device)
-
-            log_probs = model(xb)  # [T,B,V]
-            T = int(log_probs.shape[0])
-
-            input_lens = width_to_time_steps(valid_widths).to(cfg.device)  # [B]
-
-            # clamp input_lens to T
-            if (input_lens > T).any().item():
-                bad = int((input_lens > T).sum().item())
-                print(
-                    f"[epoch {epoch}] WARN: {bad} samples had input_lens > T (T={T}); clamping to T.",
-                    flush=True,
-                )
-                input_lens = torch.clamp(input_lens, max=T)
-
-            bad_ctc = (input_lens < target_lens).sum().item()
-            bad_ctc_ratio = float(bad_ctc) / max(1.0, float(xb.shape[0]))
-
-            loss = ctc_loss(log_probs, targets, input_lens, target_lens)
-
-            # NaN/Inf checks
-            if not torch.isfinite(loss).item():
-                print(
-                    f"[epoch {epoch}] ERROR: loss is not finite: {float(loss.item())}",
-                    flush=True,
-                )
-                if cfg.strict_nan:
-                    raise RuntimeError("Non-finite loss detected.")
-            if (global_step % cfg.diag_every == 0) and (
-                not _is_finite_tensor(log_probs)
-            ):
-                print(f"[epoch {epoch}] ERROR: log_probs contains NaN/Inf.", flush=True)
-                if cfg.strict_nan:
-                    raise RuntimeError("Non-finite log_probs detected.")
-
-            opt.zero_grad()
-            loss.backward()
-            gnorm = _grad_norm(model)
-            opt.step()
-
-            tr.update(batch_size=int(xb.shape[0]), loss_value=float(loss.item()))
-
-            if tr.should_print():
-                print(tr.render(prefix=f"[epoch {epoch}] train:"), flush=True)
-                tr.mark_printed()
-
-            if global_step % cfg.diag_every == 0:
-                vw = valid_widths.detach().cpu()
-                il = input_lens.detach().cpu()
-                tl = target_lens.detach().cpu()
-
-                msg: List[str] = []
-                msg.append(f"[epoch {epoch}] DIAG step={global_step}")
-                msg.append(
-                    f"  xb.shape={tuple(xb.shape)}  log_probs.shape={tuple(log_probs.shape)}  T={T}"
-                )
-                msg.append(
-                    f"  valid_widths: min={int(vw.min())} mean={float(vw.float().mean()):.1f} max={int(vw.max())}"
-                )
-                msg.append(
-                    f"  input_lens:   min={int(il.min())} mean={float(il.float().mean()):.1f} max={int(il.max())} (clamped<=T)"
-                )
-                msg.append(
-                    f"  target_lens:  min={int(tl.min())} mean={float(tl.float().mean()):.2f} max={int(tl.max())}"
-                )
-                msg.append(
-                    f"  bad_ctc(input_lens<target_lens)={int(bad_ctc)}/{int(xb.shape[0])} ({bad_ctc_ratio*100:.1f}%)"
-                )
-                msg.append(
-                    f"  loss={float(loss.item()):.6f} grad_norm={gnorm:.3f} lr={opt.param_groups[0]['lr']:.6g}"
-                )
-                if bad_ctc_ratio >= cfg.max_bad_ctc_ratio:
-                    msg.append(
-                        "  WARN: bad_ctc_ratio is high. Consider increasing min_w, reducing downsample, or filtering tiny samples."
-                    )
-                if not torch.isfinite(loss).item():
-                    msg.append("  WARN: loss is non-finite.")
-                print("\n".join(msg), flush=True)
-
-        train_loss = tr.loss_sum / max(1, tr.step)
-
-        # ---- Val ----
-        model.eval()
-        va = EpochProgress(
-            total_steps=len(val_loader), total_samples=len(val_ds), pcfg=pcfg
+        train1, val1, tr1n, va1n = build_loaders_from_items(
+            items=ds_synth.items,
+            vocab=vocab,
+            ink_thresh=cfg.ink_thresh,
+            min_w=cfg.min_w,
+            val_ratio=cfg.val_ratio,
+            seed=cfg.seed,
+            batch_size=cfg.batch_size,
+            num_workers=cfg.num_workers,
+        )
+        train2, val2, tr2n, va2n = build_loaders_from_items(
+            items=ds_hand.items,
+            vocab=vocab,
+            ink_thresh=cfg.ink_thresh,
+            min_w=cfg.min_w,
+            val_ratio=cfg.val_ratio,
+            seed=cfg.seed + 1,  # small change to avoid identical split patterns
+            batch_size=cfg.batch_size,
+            num_workers=cfg.num_workers,
         )
 
-        total_edit = 0
-        total_chars = 0
-        total_exact = 0
-        total_samples = 0
-        preview_pairs: List[Tuple[str, str]] = []
-
-        with torch.no_grad():
-            for xb, valid_widths, targets, target_lens in val_loader:
-                xb = xb.to(cfg.device)
-                targets = targets.to(cfg.device)
-                target_lens = target_lens.to(cfg.device)
-
-                log_probs = model(xb)
-                T = int(log_probs.shape[0])
-
-                input_lens = width_to_time_steps(valid_widths).to(cfg.device)
-                if (input_lens > T).any().item():
-                    input_lens = torch.clamp(input_lens, max=T)
-
-                loss = ctc_loss(log_probs, targets, input_lens, target_lens)
-                va.update(batch_size=int(xb.shape[0]), loss_value=float(loss.item()))
-
-                if va.should_print():
-                    print(va.render(prefix=f"[epoch {epoch}]  val:"), flush=True)
-                    va.mark_printed()
-
-                preds = _ctc_greedy_decode_batch(log_probs, input_lens, vocab)
-
-                # rebuild target strings from flat targets/target_lens
-                tlist = targets.detach().cpu().tolist()
-                lens = target_lens.detach().cpu().tolist()
-                off = 0
-                for i, L in enumerate(lens):
-                    ids = tlist[off : off + L]
-                    off += L
-                    tgt = "".join([vocab.itos[j - 1] for j in ids])
-                    pred = preds[i]
-
-                    d = _levenshtein(tgt, pred)
-                    total_edit += d
-                    total_chars += max(1, len(tgt))
-                    total_exact += 1 if tgt == pred else 0
-                    total_samples += 1
-
-                if (epoch % cfg.preview_every == 0) and (
-                    len(preview_pairs) < cfg.preview_samples
-                ):
-                    tlist2 = targets.detach().cpu().tolist()
-                    lens2 = target_lens.detach().cpu().tolist()
-                    off2 = 0
-                    for i, L in enumerate(lens2):
-                        if len(preview_pairs) >= cfg.preview_samples:
-                            break
-                        ids = tlist2[off2 : off2 + L]
-                        off2 += L
-                        tgt = "".join([vocab.itos[j - 1] for j in ids])
-                        preview_pairs.append((tgt, preds[i]))
-
-        val_loss = va.loss_sum / max(1, va.step)
-        cer = float(total_edit) / max(1.0, float(total_chars))
-        acc = float(total_exact) / max(1.0, float(total_samples))
-
-        print(
-            f"[epoch {epoch}] summary: train_loss={train_loss:.4f} val_loss={val_loss:.4f} val_CER={cer:.4f} val_exact={acc:.4f}",
-            flush=True,
+        header_extra.append(
+            f"datasets_synth={len(cfg.datasets_synth)} synth_train_samples={tr1n} synth_val_samples={va1n}"
+        )
+        header_extra.append(
+            f"datasets_hand={len(cfg.datasets_hand)} hand_train_samples={tr2n} hand_val_samples={va2n}"
         )
 
-        if (epoch % cfg.preview_every == 0) and preview_pairs:
-            print(f"[epoch {epoch}] preview (val, greedy decode):", flush=True)
-            for i, (tgt, pred) in enumerate(
-                preview_pairs[: cfg.preview_samples], start=1
-            ):
-                ok = "OK" if tgt == pred else "NG"
-                print(f"  {i:02d} {ok}  tgt='{tgt}'  pred='{pred}'", flush=True)
+        _print_once_header(cfg, vocab, header_extra=header_extra)
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        best_val_loss = float("inf")
+        global_step = 0
+
+        # ---- Stage 1: synth ----
+        opt1 = torch.optim.Adam(model.parameters(), lr=cfg.stage1_lr)
+        save_best_stage1 = (cfg.save_best_by == "stage1")
+        global_step, best_val_loss = run_train_val(
+            stage_name="stage1",
+            cfg=cfg,
+            model=model,
+            opt=opt1,
+            ctc_loss=ctc_loss,
+            vocab=vocab,
+            train_loader=train1,
+            val_loader=val1,
+            pcfg=pcfg,
+            start_global_step=global_step,
+            best_val_loss=best_val_loss,
+            ckpt_path=ckpt,
+            save_best=save_best_stage1,
+        )
+
+        # ---- Stage 2: handwriting ----
+        opt2 = torch.optim.Adam(model.parameters(), lr=cfg.stage2_lr)
+        save_best_stage2 = (cfg.save_best_by == "stage2")
+        global_step, best_val_loss = run_train_val(
+            stage_name="stage2",
+            cfg=cfg,
+            model=model,
+            opt=opt2,
+            ctc_loss=ctc_loss,
+            vocab=vocab,
+            train_loader=train2,
+            val_loader=val2,
+            pcfg=pcfg,
+            start_global_step=global_step,
+            best_val_loss=best_val_loss,
+            ckpt_path=ckpt,
+            save_best=save_best_stage2,
+        )
+
+        # If user chose stage1 for best-save, stage2 might not have saved.
+        # Ensure at least one checkpoint exists by saving final weights if ckpt missing.
+        if not ckpt.is_file():
             torch.save(model.state_dict(), ckpt)
-            print(
-                f"[epoch {epoch}] best checkpoint saved -> {ckpt} (best_val_loss={best_val_loss:.6f})",
-                flush=True,
-            )
+            print(f"[final] checkpoint saved -> {ckpt}", flush=True)
 
-    # TorchScript export
+    else:
+        # Single-stage: split on union dataset
+        train_loader, val_loader, train_n, val_n = build_loaders_from_items(
+            items=ds_all.items,
+            vocab=vocab,
+            ink_thresh=cfg.ink_thresh,
+            min_w=cfg.min_w,
+            val_ratio=cfg.val_ratio,
+            seed=cfg.seed,
+            batch_size=cfg.batch_size,
+            num_workers=cfg.num_workers,
+        )
+        header_extra.append(
+            f"datasets={len(cfg.datasets)} train_samples={train_n} val_samples={val_n}"
+        )
+        _print_once_header(cfg, vocab, header_extra=header_extra)
+
+        opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+
+        best_val_loss = float("inf")
+        global_step = 0
+        global_step, best_val_loss = run_train_val(
+            stage_name="single",
+            cfg=cfg,
+            model=model,
+            opt=opt,
+            ctc_loss=ctc_loss,
+            vocab=vocab,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            pcfg=pcfg,
+            start_global_step=global_step,
+            best_val_loss=best_val_loss,
+            ckpt_path=ckpt,
+            save_best=True,
+        )
+
+        if not ckpt.is_file():
+            torch.save(model.state_dict(), ckpt)
+            print(f"[final] checkpoint saved -> {ckpt}", flush=True)
+
+    # TorchScript export (from best checkpoint)
     state = torch.load(ckpt, map_location="cpu")
     model.load_state_dict(state)
     model = model.to("cpu")
