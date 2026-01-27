@@ -56,7 +56,7 @@ def hiragana_charset(
     for cp in range(0x3041, 0x3097):  # ぁ..ゖ
         chars.append(chr(cp))
     if include_punct:
-        chars += ["ー", "、", "。"]
+        chars += ["ー", "、", "。","ペ"]
     if include_space:
         chars += [" "]
     out: List[str] = []
